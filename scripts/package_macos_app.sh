@@ -249,13 +249,5 @@ done < <(find "$APP_PATH/Contents" -type f \( -perm -111 -o -name "*.dylib" -o -
 
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate_macos_bundle.py" "$APP_PATH" "${@:2}"
 
-# Include manually copied Mach-O images (including both Vulkan loader names),
-# which macdeployqt's signing list does not necessarily contain.
-while IFS= read -r -d '' file; do
-  if otool -h "$file" >/dev/null 2>&1; then
-    codesign --force --sign - "$file"
-  fi
-done < <(find "$APP_PATH/Contents" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
-codesign --force --deep --sign - "$APP_PATH"
-codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+python3 "$(dirname "${BASH_SOURCE[0]}")/sign_macos_bundle.py" "$APP_PATH"
 echo "Packaged: $APP_PATH"

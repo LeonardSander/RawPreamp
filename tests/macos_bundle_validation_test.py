@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+import plistlib
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +15,8 @@ spec = importlib.util.spec_from_file_location(
     Path(__file__).resolve().parents[1] / "scripts/validate_macos_bundle.py")
 validator = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(validator)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import sign_macos_bundle
 
 
 class BundleValidationTest(unittest.TestCase):
@@ -72,6 +76,35 @@ class BundleValidationTest(unittest.TestCase):
     def test_absolute_external_dependency_rejected(self):
         self.metadata[self.main] = (["/opt/homebrew/lib/libtest.dylib"], [])
         self.assertEqual(len(validator.validate(self.app)), 1)
+
+    def test_sign_nested_code_before_main_app(self):
+        contents = self.app / "Contents"
+        (contents / "Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "RawPreamp"}))
+        brotli = self.image("Frameworks/libbrotlicommon.1.dylib")
+        # Libraries do not need executable permissions to require signing.
+        brotli.chmod(0o644)
+        vulkan = self.image("Frameworks/libvulkan.1.dylib")
+        (contents / "Frameworks/libvulkan.dylib").symlink_to(vulkan.name)
+        mount = self.image("Frameworks/MFMount.framework/Versions/A/MFMount")
+        helper = self.image("MacOS/7zz")
+        signed = set()
+
+        def codesign(command, **kwargs):
+            path = Path(command[-1])
+            if "--verify" in command:
+                self.assertIn(self.app, signed)
+            else:
+                if path == self.app:
+                    self.assertTrue({brotli, vulkan, mount, helper,
+                                     contents / "Frameworks/MFMount.framework"} <= signed)
+                if path == contents / "Frameworks/MFMount.framework":
+                    self.assertIn(mount, signed)
+                self.assertNotEqual(path, self.main)
+                signed.add(path)
+
+        with patch.object(sign_macos_bundle.subprocess, "run", side_effect=codesign) as run:
+            sign_macos_bundle.sign(self.app)
+        self.assertEqual(run.call_args.args[0][1], "--verify")
 
     def test_macfuse_mount_framework_must_be_bundled(self):
         self.metadata[self.main] = (["@rpath/libfuse.2.dylib"], self.metadata[self.main][1])
