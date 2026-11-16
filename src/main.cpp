@@ -1,5 +1,7 @@
 #include "UiMode.h"
 #include "DebugInstrumentation.h"
+#include "SpatialGainValidation.h"
+#include "VulkanJpegBenchmark.h"
 #include "mainwindow.h"
 #include "SingleApplication.h"
 #include "NativeVideoDecoder.h"
@@ -739,6 +741,12 @@ int main(int argc, char *argv[])
         "Comma separated gallery benchmark scenario flags",
         "flags");
 #if RAWPREAMP_DEBUG_INSTRUMENTATION
+    QCommandLineOption tiledJpegBenchmarkOption(QStringList() << "tiled-jpeg-benchmark",
+        "Benchmark resident tiled JPEG decode/encode roundtrips", "configuration");
+    QCommandLineOption rawDecodeTestOption(QStringList() << "raw-decode-self-test",
+        "Validate Vulkan raw decode and resident processing", "report");
+    QCommandLineOption spatialGainTestOption(QStringList() << "spatial-gain-self-test",
+        "Validate general spatial gain processing", "report");
     QCommandLineOption nativeVideoJpegBenchmarkOption(
         QStringList() << "native-video-jpeg-benchmark",
         "Compare remosaiced Native Video GPU JPEG with raw pixel download",
@@ -755,6 +763,9 @@ int main(int argc, char *argv[])
     parser.addOption(galleryPerfFlagsOption);
 #if RAWPREAMP_DEBUG_INSTRUMENTATION
     parser.addOption(nativeVideoJpegBenchmarkOption);
+    parser.addOption(spatialGainTestOption);
+    parser.addOption(rawDecodeTestOption);
+    parser.addOption(tiledJpegBenchmarkOption);
 #endif
     QStringList arguments = app.arguments();
 #ifdef __ANDROID__
@@ -762,7 +773,7 @@ int main(int argc, char *argv[])
     if (activity.isValid()) {
         for (const QString& option : {QStringLiteral("gallery-perf-session"),
                 QStringLiteral("gallery-perf-playback-ms"), QStringLiteral("gallery-perf-flags"),
-                QStringLiteral("gallery-perf-thumbnails")}) {
+                QStringLiteral("gallery-perf-thumbnails"), QStringLiteral("spatial-gain-self-test"), QStringLiteral("raw-decode-self-test"), QStringLiteral("tiled-jpeg-benchmark")}) {
             const QString value = activity.callMethod<QString>("galleryPerfArgument", option);
             if (!value.isEmpty()) arguments << "--" + option << value;
         }
@@ -797,8 +808,41 @@ int main(int argc, char *argv[])
         {"guipool", "QT_NO_GUI_THREADPOOL", nullptr},
         {"zerocopy", "RAWPREAMP_GALLERY_REQUIRE_ZERO_COPY", "1"},
         {"unfuseddecode", "RAWPREAMP_ANDROID_FUSED_DECODE", "0"},
+        {"rawstages", "RAWPREAMP_RAW_GPU_TIMERS", "1"},
+        {"rawcpu", "RAWPREAMP_RAW_GPU_DISABLE", "1"},
+        {"rawbytefields", "RAWPREAMP_RAW_BYTE_FIELDS", "1"},
+        {"coordsold", "RAWPREAMP_GALLERY_REPEAT_COORDINATES", "1"},
+        {"rawdecodefail", "RAWPREAMP_TEST_FAIL_RAW_GPU_DECODE", "1"},
+        {"rawcolorfail", "RAWPREAMP_TEST_FAIL_GALLERY_COLOR", "1"},
         {"hashpreview", "RAWPREAMP_GALLERY_PERF_HASH_PREVIEW", "1"},
         {"jpegprofile", "RAWPREAMP_JPEG_DECODE_PROFILE", "1"},
+        {"jpegloops", "RAWPREAMP_JPEG_COMPONENT_LOOPS", "1"},
+        {"jpegserialvalidate", "RAWPREAMP_JPEG_SERIAL_VALIDATE", "1"},
+        {"jpegskipscan", "RAWPREAMP_JPEG_SKIP_SCAN", "1"},
+        {"jpegdynamicpredictor", "RAWPREAMP_JPEG_DYNAMIC_PREDICTOR", "1"},
+        {"jpegseparateresidual", "RAWPREAMP_JPEG_SEPARATE_RESIDUAL", "1"},
+        {"jpegwg8", "RAWPREAMP_JPEG_GROUP_SIZE", "8"},
+        {"jpegwg16", "RAWPREAMP_JPEG_GROUP_SIZE", "16"},
+        {"jpegwg32", "RAWPREAMP_JPEG_GROUP_SIZE", "32"},
+        {"jpeglookup7", "RAWPREAMP_JPEG_LOOKUP_BITS", "7"},
+        {"jpeglookup9", "RAWPREAMP_JPEG_LOOKUP_BITS", "9"},
+        {"jpeglookup10", "RAWPREAMP_JPEG_LOOKUP_BITS", "10"},
+        {"jpeglookupauto9", "RAWPREAMP_JPEG_LOOKUP_BITS", "auto9"},
+        {"gpupooloff", "RAWPREAMP_GPU_POOL_DISABLE", "1"},
+        {"uploadcacheoff", "RAWPREAMP_GPU_UPLOAD_CACHE_DISABLE", "1"},
+        {"jpegprefill7", "RAWPREAMP_JPEG_PREFILL_BITS", "7"},
+        {"jpegprefill24", "RAWPREAMP_JPEG_PREFILL_BITS", "24"},
+        {"gainfieldcheck", "RAWPREAMP_GAIN_FIELD_VERIFY", "1"},
+        {"gainfieldoff", "RAWPREAMP_GAIN_FIELD_DISABLE", "1"},
+        {"bayerloops", "RAWPREAMP_GALLERY_BAYER_LOOPS", "1"},
+        {"gaincaptureoff", "RAWPREAMP_GAIN_FIELD_CAPTURE_DISABLE", "1"},
+        {"rgbscalar", "RAWPREAMP_GALLERY_RGB_SCALAR", "1"},
+        {"dcptexture", "RAWPREAMP_DCP_TEXTURES", "1"},
+        {"dcpbuffer", "RAWPREAMP_DCP_TEXTURES", "0"},
+        {"dcptexturefail", "RAWPREAMP_TEST_DCP_TEXTURE_FAIL", "1"},
+        {"jpegreservoir", "RAWPREAMP_JPEG_RESERVOIR", "1"},
+        {"jpegoldentropy", "RAWPREAMP_JPEG_RESERVOIR", "0"},
+        {"jpegcpu", "RAWPREAMP_GPU_JPEG_DECODE_DISABLE", "1"},
         {"nohist", "RAWPREAMP_GALLERY_PERF_NO_HISTOGRAM", "1", true},
         {"hidethumbnails", "RAWPREAMP_GALLERY_PERF_HIDE_THUMBNAILS", "1", true},
         {"openthumbnails", "RAWPREAMP_GALLERY_PERF_OPEN_THUMBNAILS_DURING_PLAYBACK", "500", true},
@@ -823,6 +867,12 @@ int main(int argc, char *argv[])
             }
 
 #if RAWPREAMP_DEBUG_INSTRUMENTATION
+    if (parser.isSet(tiledJpegBenchmarkOption))
+        return rawpreamp::runVulkanJpegBenchmark(parser.value(tiledJpegBenchmarkOption).toStdString());
+    if (parser.isSet(rawDecodeTestOption))
+        return rawpreamp::runRawDecodeValidation(parser.value(rawDecodeTestOption).toStdString());
+    if (parser.isSet(spatialGainTestOption))
+        return rawpreamp::runSpatialGainValidation(parser.value(spatialGainTestOption).toStdString());
     if (parser.isSet(nativeVideoJpegBenchmarkOption)) {
         try {
             rawpreamp::NativeVideoDecoder decoder(

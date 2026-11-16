@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace rawpreamp {
@@ -24,6 +25,8 @@ struct VulkanGainBakeTextureSource {
 struct VulkanGainBakeBufferSource {
     const void* gpu = nullptr;
     const void* buffer = nullptr;
+    std::shared_ptr<void> deviceLease;
+    const void* validationBuffer = nullptr;
 };
 struct VulkanPackedImage {
     const void* gpu = nullptr;
@@ -46,6 +49,9 @@ struct VulkanGainBakeParams {
     // Called while the packed GPU output remains live. A true result means
     // the caller has consumed it and no uncompressed readback is needed.
     std::function<bool(const VulkanPackedImage&)> consumePackedOutput;
+    // Resident decode paths restart from compressed source on encoder failure,
+    // instead of downloading an intermediate packed image for another upload.
+    bool requirePackedOutputConsumer = false;
     VulkanRgbGainMap map;
     std::array<VulkanRgbGainMap, 4> cfaMaps{};
     uint32_t cfaMapCount = 0;

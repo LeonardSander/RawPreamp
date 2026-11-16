@@ -5,19 +5,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
+#include <vector>
 
 namespace rawpreamp {
-// Shared by the lossless JPEG predictor and entropy passes. Both callers hold
-// this mutex while issuing commands on the libplacebo GPU.
+// Shared by raw/JPEG decode, proxy reduction and resident processing. Callers
+// hold this mutex while issuing commands on this libplacebo GPU.
 struct VulkanJpegContext {
-    std::mutex mutex;
+    // A consumer may release its last image lease during a submission. Allow
+    // that nested retirement while serializing GPU work across threads.
+    std::recursive_mutex mutex;
     pl_log log = nullptr;
     pl_vulkan vulkan = nullptr;
     bool unavailable = false;
+    // Pool access and GPU destruction use the same submission lock. Leases
+    // retain this context and may retire on any consumer thread.
+    std::vector<pl_buf> retiredImages;
+    size_t retiredImageBytes = 0;
+    std::shared_ptr<void> acquireImage(size_t bytes, pl_buf& buffer);
+    void retireImage(pl_buf buffer);
+
     ~VulkanJpegContext();
     bool init();
 };
 VulkanJpegContext& jpegContext();
+// Resident consumers retain the device independently of static cache order.
+std::shared_ptr<void> jpegContextLease();
 // Call only while holding jpegContext().mutex. The buffer remains valid until
 // the next predictor scan; a source pointer mismatch signals that it changed.
 pl_buf jpegResidentImageVulkan(const uint16_t* pixels, uint32_t width,

@@ -4,6 +4,7 @@
 
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
 #include "VulkanJpegContext.h"
+#include "VulkanGalleryPreview.h"
 #include <libplacebo/vulkan.h>
 #include <libplacebo/gpu.h>
 #include <algorithm>
@@ -17,13 +18,86 @@
 #include <mutex>
 
 namespace rawpreamp {
-VulkanJpegContext& jpegContext() {
-    static VulkanJpegContext context;
+namespace {
+std::shared_ptr<VulkanJpegContext> contextOwner() {
+    static auto context = std::make_shared<VulkanJpegContext>();
     return context;
 }
+}
+VulkanJpegContext& jpegContext() { return *contextOwner(); }
+std::shared_ptr<void> jpegContextLease() { return contextOwner(); }
 VulkanJpegContext::~VulkanJpegContext() {
+    // Borrowed gallery command recorders cache resources on this context.
+    // Retire those resources before destroying the producing device.
+    if (vulkan) releaseVulkanGalleryTextureDevice(vulkan->gpu);
+    if (vulkan)
+        for (auto& buffer : retiredImages) pl_buf_destroy(vulkan->gpu, &buffer);
     pl_vulkan_destroy(&vulkan);
     pl_log_destroy(&log);
+}
+std::shared_ptr<void> VulkanJpegContext::acquireImage(size_t bytes, pl_buf& buffer) {
+    std::lock_guard lock(mutex);
+    buffer = nullptr;
+    if (!vulkan || !bytes || bytes > vulkan->gpu->limits.max_ssbo_size) return {};
+    const bool disabled = rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GPU_POOL_DISABLE");
+    if (!disabled) {
+        for (auto it = retiredImages.begin(); it != retiredImages.end(); ++it) {
+            // Exact sizes prevent retaining a large allocation for a small proxy.
+            // Never block waiting for a retired frame still in flight.
+            if ((*it)->params.size == bytes && !pl_buf_poll(vulkan->gpu, *it, 0)) {
+                buffer = *it;
+                retiredImageBytes -= bytes;
+                retiredImages.erase(it);
+                break;
+            }
+        }
+    }
+    if (!buffer) {
+        pl_buf_params params{};
+        params.size = bytes;
+        params.storable = true;
+        params.memory_type = PL_BUF_MEM_DEVICE;
+        buffer = pl_buf_create(vulkan->gpu, &params);
+        if (!buffer && !disabled) {
+            // Cached frames must not prevent CPU/hardware fallback from having
+            // room. Drop retired storage and retry without a GPU-wide wait.
+            for (auto& retired : retiredImages) pl_buf_destroy(vulkan->gpu, &retired);
+            retiredImages.clear();
+            retiredImageBytes = 0;
+            buffer = pl_buf_create(vulkan->gpu, &params);
+        }
+        if (!buffer) return {};
+    }
+    return std::shared_ptr<void>(new pl_buf(buffer),
+        [this, deviceLease = jpegContextLease(), disabled](void* pointer) {
+            auto* owned = static_cast<pl_buf*>(pointer);
+            if (disabled) {
+                std::lock_guard lock(mutex);
+                pl_buf_destroy(vulkan->gpu, owned);
+            } else {
+                retireImage(*owned);
+            }
+            delete owned;
+        });
+}
+void VulkanJpegContext::retireImage(pl_buf buffer) {
+    std::lock_guard submissionLock(mutex);
+    constexpr size_t budget = 96u * 1024u * 1024u;
+    if (buffer->params.size > budget) {
+        pl_buf_destroy(vulkan->gpu, &buffer);
+        return;
+    }
+    // Evict oldest sizes on clip/proxy changes, rather than letting an old
+    // resolution fill the pool permanently and exclude new frame sizes.
+    while (!retiredImages.empty() &&
+           (retiredImages.size() >= 4 || buffer->params.size > budget - retiredImageBytes)) {
+        auto oldest = retiredImages.front();
+        retiredImageBytes -= oldest->params.size;
+        retiredImages.erase(retiredImages.begin());
+        pl_buf_destroy(vulkan->gpu, &oldest);
+    }
+    retiredImages.push_back(buffer);
+    retiredImageBytes += buffer->params.size;
 }
 bool VulkanJpegContext::init() {
     if (unavailable) return false;

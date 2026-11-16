@@ -202,7 +202,8 @@ preprocessData(
     QuadBayerMode quadBayerOption,
     bool includeOpcode,
     uint32_t ditherSeed = 0,
-    bool linearizePreview = false);
+    bool linearizePreview = false,
+    bool metadataOnly = false);
 
 std::shared_ptr<std::vector<uint8_t>> generateDng(
     std::vector<uint8_t>& data,
@@ -219,7 +220,8 @@ std::shared_ptr<std::vector<uint8_t>> generateDng(
     PreviewFrame* previewFrame = nullptr,
     bool retainSourceSamples = false,
     DecodedDNGImage* stagedImage = nullptr,
-    bool unpackedIntermediate = false);
+    bool unpackedIntermediate = false,
+    bool metadataOnly = false);
 
 // Draws a centered, outlined ISO label into unpacked 16-bit image samples.
 void forEachIsoOverlayPixel(uint32_t width, uint32_t height, double iso,

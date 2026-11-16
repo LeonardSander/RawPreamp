@@ -329,6 +329,23 @@ controlled comparisons without deleting it. `profile` also reports `dng_source_r
 open, allocation and read timings. `preserveproxy` retains the session's saved
 proxy scale and reconstruction quality.
 
+Raw-container previews select resident Vulkan decoding by default for supported
+MotionCam block streams, MC24 strips and Unspektra UFR1 layouts. Unsupported
+settings and failed GPU decode attempts use the original CPU decoder. In a Debug
+benchmark, `rawcpu` selects CPU decoding for comparison and `rawdecodefail`
+simulates an unavailable raw GPU decoder to exercise automatic fallback.
+`rawcolorfail` exercises CPU source recovery after resident decode and proxy reduction.
+`dcpbuffer` compares the previous storage-buffer color-table sampler against the
+default full-float texture sampler; `dcptexturefail` tests its GPU fallback.
+`jpegcpu` selects CPU JPEG decode for comparison; `jpegoldentropy` compares the
+previous entropy reader against the default GPU bit reservoir.
+`rawstages` adds asynchronous GPU timings for unpacking, prediction, Bayer preparation and color; use it separately from throughput comparisons.
+`profile` records `raw_decode` with codec, chosen backend and GPU eligibility;
+`gallery_shared_image` and `gallery_dma_buf` identify image presentation without
+host pixel transfer. These diagnostic switches do not alter Release behavior.
+For representative diagnostic timings, configure Debug with
+`-DRAWPREAMP_OPTIMIZED_DEBUG=ON`; ordinary Debug builds deliberately use `-O0`.
+
 Android gallery automation accepts `gallery-perf-session`,
 `gallery-perf-playback-ms`, `gallery-perf-thumbnails` and `gallery-perf-flags`
 intent extras. Use `profile,nohist,hidethumbnails,skipbackfill,preserveproxy,keepalive`
@@ -410,3 +427,73 @@ exit-info on a connected device.
 Other drivers and non-seekable document providers still need device coverage.
 Android starts with a 256 MiB frame cache, two I/O workers and at most four
 processing workers. Raising these budgets requires memory-pressure measurements.
+
+
+### Resident tiled JPEG roundtrip benchmark (Debug)
+
+Pass the app-private configuration path as the Android `tiled-jpeg-benchmark`
+intent extra (desktop equivalent: `--tiled-jpeg-benchmark`). For example:
+
+```json
+{
+  "source": "/data/user/0/com.rawpreamp.app/files/raw-vulkan-test/tiled-jpeg-12mp",
+  "report": "/data/user/0/com.rawpreamp.app/files/raw-vulkan-test/jpeg-result.json",
+  "iterations": 5,
+  "validate_precisions": true
+}
+```
+
+`source` accepts a tiled DNG or a directory, using its first sorted `.dng` frame.
+The benchmark requires complete, even-sized CFA/RGB tiles and 8–16 stored bits.
+Optional `encode_tile_width` / `encode_tile_height` select complete roundtrip
+tiles; defaults are the source tile dimensions capped at 128. The JSON report
+contains per-iteration and median synchronized times for source decode, GPU
+packing/encode, resident re-decode and their sum. File I/O, CPU references and
+validation are excluded from timing. Pixel data stays on the GPU during the
+measured chain; only small comparison/status words are read back. Precision
+fixtures additionally validate compressed JPEGs with the CPU decoder before
+measurements. Every measured roundtrip must preserve the stored codes exactly.
+
+Use `gallery-perf-flags=jpegloops` to compare the previous component loop with the
+default specialization. The installed Debug build retains these two configurations
+as `files/raw-vulkan-test/jpeg-loops.json` and `jpeg-specialized.json`, alongside
+their reports. See [Vulkan measurements](vulkan-raw-performance.md) for results.
+
+
+Small tiled JPEGs use parallel entropy validation by default. For Debug
+comparisons, add `jpegserialvalidate` to reproduce the previous serial scan or
+`jpegskipscan` to omit the entropy byte-stuffing scan. The latter retains header,
+bounds and decoder-status checks, but is intended for trusted benchmark inputs:
+invalid byte stuffing may be accepted. It showed no consistent latency benefit
+over parallel validation on the tested phone. Neither flag changes raw processing,
+resolution, stored precision or the exact-pixel roundtrip comparisons.
+
+
+The default JPEG decoder selects a specialized diagonal predictor for applicable
+single-component tiles and consumes buffered Huffman/residual bits together.
+Debug `jpegdynamicpredictor,jpegseparateresidual` restores the decoder before
+these two changes. Both work in the existing tiled JPEG roundtrip benchmark and
+gallery perf scenarios; validation remains enabled during normal comparisons.
+
+
+Adreno JPEG decode defaults to 16 invocations per source workgroup and 32 for
+resident encoded JPEG input. Other GPUs retain eight. Debug `jpegwg8` restores
+the previous choice for both paths; `jpegwg16` / `jpegwg32` force those sizes.
+These flags affect decode only, including resident roundtrip benchmarking, and
+leave entropy validation and processing settings unchanged. The dispatch profile
+includes `group_size`; see the latest [measurements](vulkan-raw-performance.md).
+
+
+Retained Adreno JPEG previews can now share 9-bit Huffman lookups across tiles.
+Automatic selection requires at least 128 tiles, enough repeated DHT payloads,
+and at most 64 MiB of lookup storage; it otherwise retries the 7-bit GPU path.
+Streaming source consumers keep the shorter 7-bit setup path. Resident encoded
+JPEG re-decode uses its single shared 9-bit table on Adreno. No tile dimensions,
+raw-processing settings or validation checks change.
+
+Debug `jpeglookup7` restores the old width for both paths; `jpeglookup9` and
+`jpeglookup10` force experimental widths. `jpeglookupauto9` exercises automatic
+admission even on another GPU. Source setup adds latency in the synchronized
+retained-image roundtrip benchmark, while measured ordinary 12 MP playback
+improves from 22.10 to 23.64 fps. The detailed [measurements](vulkan-raw-performance.md)
+include that tradeoff and the rejected two-stage reconstruction experiments.

@@ -78,10 +78,16 @@ set(PROJECT_SOURCES
         src/NativeVideoDecoder.cpp
         src/NativeVideoGpuRgb.cpp
         src/VulkanGainBake.cpp
+        src/SpatialGainValidation.cpp
+        src/VulkanJpegBenchmark.cpp
+        $<$<CONFIG:Debug>:tests/mcraw_vulkan_test.cpp>
+        $<$<CONFIG:Debug>:tests/native_raw_vulkan_test.cpp>
         src/VulkanJpegPredictor.cpp
         src/VulkanJpegEntropy.cpp
         src/VulkanJpegFullEncode.cpp
+        src/VulkanRawDecode.cpp
         src/VulkanJpegDecode.cpp
+        src/VulkanResidentImage.cpp
         src/VulkanGalleryPreview.cpp
         shaders/vulkan_gain_bake.comp
         shaders/vulkan_cfa_gain_bake.comp
@@ -334,19 +340,22 @@ if(APPLE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE FUSE_USE_VERSION=26)
 endif()
 
+# Keep performance diagnostics available without forcing an unoptimized app.
+option(RAWPREAMP_OPTIMIZED_DEBUG "Optimize Debug builds while retaining diagnostics" OFF)
+set(rawpreamp_debug_optimization "$<IF:$<BOOL:${RAWPREAMP_OPTIMIZED_DEBUG}>,-O2,-O0>")
 # Debug symbols configuration
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         # MSVC with PDB symbols (not LLDB-compatible)
-        target_compile_options(${PROJECT_NAME} PRIVATE /Zi /Od /MDd)
+        target_compile_options(${PROJECT_NAME} PRIVATE /Zi "$<IF:$<BOOL:${RAWPREAMP_OPTIMIZED_DEBUG}>,/O2,/Od>" /MDd)
         target_link_options(${PROJECT_NAME} PRIVATE /DEBUG:FASTLINK)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         # Clang/GCC with DWARF symbols (LLDB-compatible)
-        target_compile_options(${PROJECT_NAME} PRIVATE -g -O0 -gdwarf-4 -fno-omit-frame-pointer)
+        target_compile_options(${PROJECT_NAME} PRIVATE -g ${rawpreamp_debug_optimization} -gdwarf-4 -fno-omit-frame-pointer)
         # Better debugging experience
         target_compile_options(${PROJECT_NAME} PRIVATE -fno-limit-debug-info)
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(${PROJECT_NAME} PRIVATE -g -O0 -gdwarf-4 -fno-omit-frame-pointer)
+        target_compile_options(${PROJECT_NAME} PRIVATE -g ${rawpreamp_debug_optimization} -gdwarf-4 -fno-omit-frame-pointer)
     endif()
 endif()
 
@@ -1002,23 +1011,36 @@ if(BUILD_TESTING)
 
     add_executable(rawpreamp-lossless-jpeg-test
         tests/lossless_jpeg_test.cpp
+        tests/mcraw_vulkan_test.cpp
+        tests/native_raw_vulkan_test.cpp
         src/IsoOverlay.cpp
         src/VulkanGainBake.cpp
         src/VulkanJpegPredictor.cpp
         src/VulkanJpegEntropy.cpp
         src/VulkanJpegFullEncode.cpp
+        src/VulkanRawDecode.cpp
         src/VulkanJpegDecode.cpp
+        src/VulkanResidentImage.cpp
         src/VulkanGalleryPreview.cpp
         src/DNGDecoder.cpp
         src/HigherCFADemosaic.cpp
         deps/motioncam-decoder/thirdparty/liblj92/lj92.c)
+    # Codec overrides must remain testable in optimized standalone builds.
+    # Directory definitions disable diagnostics for Release application code.
+    if(MSVC)
+        target_compile_options(rawpreamp-lossless-jpeg-test PRIVATE
+            /URAWPREAMP_DEBUG_INSTRUMENTATION /DRAWPREAMP_DEBUG_INSTRUMENTATION=1)
+    else()
+        target_compile_options(rawpreamp-lossless-jpeg-test PRIVATE
+            -URAWPREAMP_DEBUG_INSTRUMENTATION -DRAWPREAMP_DEBUG_INSTRUMENTATION=1)
+    endif()
     target_include_directories(rawpreamp-lossless-jpeg-test PRIVATE
         deps/motioncam-decoder/thirdparty
         deps/motioncam-decoder/thirdparty/liblj92)
     target_include_directories(rawpreamp-lossless-jpeg-test PRIVATE
         include "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(rawpreamp-lossless-jpeg-test PRIVATE
-        Boost::filesystem Boost::regex spdlog::spdlog JPEG::JPEG ${JXL_TARGET} RawPreampZipSource)
+        Boost::filesystem Boost::regex spdlog::spdlog JPEG::JPEG ${JXL_TARGET} RawPreampZipSource motioncam-decoder)
     if(NATIVE_VIDEO_PLACEBO_SAME_INSTALL AND NATIVE_VIDEO_VULKAN_INCLUDE_DIR)
         target_include_directories(rawpreamp-lossless-jpeg-test PRIVATE
             ${NATIVE_VIDEO_VULKAN_INCLUDE_DIR})
@@ -1038,6 +1060,7 @@ if(BUILD_TESTING)
         src/VulkanJpegEntropy.cpp
         src/VulkanJpegFullEncode.cpp
         src/VulkanJpegDecode.cpp
+        src/VulkanResidentImage.cpp
         src/DNGDecoder.cpp
         src/HigherCFADemosaic.cpp
         deps/motioncam-decoder/thirdparty/liblj92/lj92.c)
@@ -1062,6 +1085,7 @@ if(BUILD_TESTING)
         src/VulkanJpegEntropy.cpp
         src/VulkanJpegFullEncode.cpp
         src/VulkanJpegDecode.cpp
+        src/VulkanResidentImage.cpp
         src/VulkanGalleryPreview.cpp
         src/DNGDecoder.cpp
         src/HigherCFADemosaic.cpp

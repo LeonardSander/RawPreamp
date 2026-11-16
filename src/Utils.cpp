@@ -355,7 +355,7 @@ void overrideLensShadingMap(
 }
 
 std::vector<unsigned short> makeLogLinearizationTable(unsigned int storedWhiteLevel) {
-    return makeLog60LinearizationTable(storedWhiteLevel);
+    return cachedLog60LinearizationTable(storedWhiteLevel);
 }
 
 // ============================================================================
@@ -1112,7 +1112,7 @@ std::tuple<std::vector<uint8_t>, std::array<unsigned short, 4>, unsigned short,
     QuadBayerMode quadBayerOption,
     bool includeOpcode,
     uint32_t ditherSeed,
-    bool linearizePreview)
+    bool linearizePreview, bool metadataOnly)
 {
     scale = (scale > 1 ? (scale / 2) * 2 : 1); // Ensure even scale for downscaling
 
@@ -1274,6 +1274,20 @@ std::tuple<std::vector<uint8_t>, std::array<unsigned short, 4>, unsigned short,
         opcodeList2 = createLensShadingOpcodeList(opcodeMetadata, inOutWidth, inOutHeight, left, top);
     }
 
+    if (metadataOnly) {
+        if (scale != 1 || applyShadingMap || logTransform != LogTransformMode::Disabled ||
+            cropTarget != "0x0" || (cfaRepeatSize != 2 && cfaRepeatSize != 4) ||
+            newWidth != inOutWidth || newHeight != inOutHeight)
+            throw std::runtime_error("Unsupported resident MCRAW metadata staging");
+        std::array<unsigned short, 4> black{};
+        for (size_t i = 0; i < black.size(); ++i)
+            black[i] = static_cast<unsigned short>(std::round(dstBlackLevel[i]));
+        // TIFF metadata is edited against a placeholder strip. No source
+        // samples are decoded, downloaded or processed here.
+        return {std::vector<uint8_t>(size_t(newWidth) * newHeight * 2), black,
+            static_cast<unsigned short>(dstWhiteLevel), opcodeList2, opcodeList3};
+    }
+
     //
     // Preprocess data
     //
@@ -1311,9 +1325,8 @@ std::tuple<std::vector<uint8_t>, std::array<unsigned short, 4>, unsigned short,
         ? makeLog60EncodeLookup(0.0, 65535.0,
               static_cast<uint16_t>(dstWhiteLevel))
         : std::vector<float>{};
-    const auto previewLinearization = linearizePreview
-        ? makeLog60LinearizationTable(static_cast<uint16_t>(dstWhiteLevel))
-        : std::vector<uint16_t>{};
+    const auto& previewLinearization = cachedLog60LinearizationTable(
+        linearizePreview ? static_cast<uint16_t>(dstWhiteLevel) : 0u);
 
     // A full-size ordinary Bayer pass reads each 2x2 block before writing it.
     // Reuse the decoder's input buffer in that case; the caller consumes the
@@ -1605,7 +1618,7 @@ std::shared_ptr<std::vector<uint8_t>> generateDng(
     PreviewFrame* previewFrame,
     bool retainSourceSamples,
     DecodedDNGImage* stagedImage,
-    bool unpackedIntermediate)
+    bool unpackedIntermediate, bool metadataOnly)
 {
     Measure m("generateDng");
     if (!metadata.linearizationTable.empty() && previewFrame) {
@@ -1840,7 +1853,7 @@ std::shared_ptr<std::vector<uint8_t>> generateDng(
         settings.quadBayerOption,
         true, // includeOpcode
         static_cast<uint32_t>(frameNumber + 1),
-        linearizePreviewCfa
+        linearizePreviewCfa, metadataOnly
     );
     const uint16_t previewLogStoredWhite = dstWhiteLevel;
     if (previewFrame) {

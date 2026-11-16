@@ -1,3 +1,5 @@
+#include "VulkanSpatialGainCache.h"
+#include "VulkanUploadCache.h"
 #include "DebugInstrumentation.h"
 #include "VulkanGalleryPreview.h"
 #include "SharedVulkanDevice.h"
@@ -129,8 +131,44 @@ void main() {
 }
 )glsl";
 
+// Diagnostic-only full-buffer comparison; image data stays on the GPU.
+constexpr char comparePreparedShader[] = R"glsl(#version 450
+layout(local_size_x=256) in;
+layout(std430,binding=0) readonly buffer A { uint words[]; } a;
+layout(std430,binding=1) readonly buffer B { uint words[]; } b;
+layout(std430,binding=2) buffer Result { uint maximum; uint different; } result;
+layout(push_constant) uniform Size { uint samples; } p;
+void main() {
+    uint word=gl_GlobalInvocationID.x + gl_GlobalInvocationID.y*gl_NumWorkGroups.x*256u;
+    if(word*2u>=p.samples) return;
+    uint x=a.words[word], y=b.words[word];
+    for(uint lane=0u;lane<2u && word*2u+lane<p.samples;++lane) {
+        uint shift=lane*16u;
+        uint delta=uint(abs(int((x>>shift)&65535u)-int((y>>shift)&65535u)));
+        if(delta!=0u) { atomicMax(result.maximum,delta); atomicAdd(result.different,1u); }
+    }
+}
+)glsl";
+
+constexpr char srgbLookupShader[] = R"glsl(#version 450
+layout(local_size_x=256) in;
+layout(std430,binding=0) writeonly buffer Lookup { float values[]; } dst;
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if(index>=65536u) return;
+    float linear=float(index)/65535.0;
+    float encoded=linear<=0.0031308 ? linear*12.92 :
+        1.055*pow(linear,1.0/2.4)-0.055;
+    dst.values[index]=floor(clamp(encoded,0.0,1.0)*65535.0+0.5);
+}
+)glsl";
+
 constexpr char colorShader[] = R"glsl(#version 450
+#ifdef GALLERY_IMAGE_OUTPUT
+layout(local_size_x = 16, local_size_y = 16) in;
+#else
 layout(local_size_x = 256) in;
+#endif
 #if defined(SOURCE_TEXTURE) || defined(SOURCE_BAYER_TEXTURE)
 layout(binding = 0) uniform sampler2D sourceImage;
 #else
@@ -153,7 +191,7 @@ layout(std430, binding = 4) readonly buffer GalleryBayerGain {
     vec4 black;
     vec4 scale;
     uvec4 lookup; // first float in values used by LOG linearization
-    uvec4 sourceGeometry; // original width, height, proxy scale, unused
+    uvec4 sourceGeometry; // original width, height, total scale, Bayer parity offset
     uvec4 bounds[32];
     vec4 axes[32];
     uvec4 shape[32]; // width, height, channels, float offset
@@ -167,14 +205,33 @@ layout(rgb10_a2, binding = 1) writeonly uniform image2D dstImage;
 #else
 layout(rgba8, binding = 1) writeonly uniform image2D dstImage;
 #endif
+#elif defined(GALLERY_GAIN_FIELD)
+layout(std430, binding = 1) writeonly buffer Destination { float values[]; } dst;
 #else
 layout(std430, binding = 1) writeonly buffer Destination { uint words[]; } dst;
+#endif
+#if defined(GALLERY_CACHED_GAIN) || defined(GALLERY_CAPTURE_GAIN)
+layout(std430, binding = 7)
+#ifdef GALLERY_CAPTURE_GAIN
+writeonly
+#else
+readonly
+#endif
+buffer CachedGain { float values[]; } cachedGain;
 #endif
 layout(std430, binding = 2) readonly buffer Profiles {
     uvec4 shapes[2]; // hue, saturation, value, encoding
     uvec4 offsets[2]; // first float, count
     float values[];
 } profiles;
+#ifdef GALLERY_PROFILE_TEXTURES
+layout(binding = 5) uniform sampler3D hueTexture;
+layout(binding = 6) uniform sampler3D lookTexture;
+vec3 profileTexel(uint table, uint v, uint h, uint s) {
+    return table == 0u ? texelFetch(hueTexture, ivec3(s,h,v), 0).rgb
+                       : texelFetch(lookTexture, ivec3(s,h,v), 0).rgb;
+}
+#endif
 layout(std430, binding = 3) readonly buffer Clipping { uint words[]; } clipping;
 layout(push_constant) uniform Constants {
     uvec4 dimensions; // pixels, output words, mode, gain-map debug
@@ -203,12 +260,10 @@ uint packedCode(uint sampleIndex) {
         float gain = 1.0;
         if (x >= galleryGain.bounds.x && y >= galleryGain.bounds.y &&
             x < galleryGain.bounds.z && y < galleryGain.bounds.w) {
-            vec2 grid = ((vec2(x, y) + vec2(0.5)) / vec2(p.geometry.xy) -
-                galleryGain.axes.xy) / galleryGain.axes.zw;
-            vec2 base = floor(grid), t = clamp(grid - base, 0.0, 1.0);
-            uvec2 a = uvec2(clamp(base, vec2(0),
-                vec2(galleryGain.shape.xy - uvec2(1))));
-            uvec2 b = min(a + uvec2(1), galleryGain.shape.xy - uvec2(1));
+            uvec2 a, b;
+            vec2 t;
+            rawpreampGainGrid(uvec2(x, y), p.geometry.xy, galleryGain.shape.xy,
+                             galleryGain.axes, a, b, t);
             uint stride = galleryGain.shape.x * 3u;
             uint ia = a.y * stride + a.x * 3u + channel;
             uint ib = a.y * stride + b.x * 3u + channel;
@@ -222,12 +277,10 @@ uint packedCode(uint sampleIndex) {
         if (galleryGain.flags.z != 0u &&
             x >= galleryGain.secondaryBounds.x && y >= galleryGain.secondaryBounds.y &&
             x < galleryGain.secondaryBounds.z && y < galleryGain.secondaryBounds.w) {
-            vec2 grid = ((vec2(x, y) + vec2(0.5)) / vec2(p.geometry.xy) -
-                galleryGain.secondaryAxes.xy) / galleryGain.secondaryAxes.zw;
-            vec2 base = floor(grid), t = clamp(grid - base, 0.0, 1.0);
-            uvec2 a = uvec2(clamp(base, vec2(0),
-                vec2(galleryGain.secondaryShape.xy - uvec2(1))));
-            uvec2 b = min(a + uvec2(1), galleryGain.secondaryShape.xy - uvec2(1));
+            uvec2 a, b;
+            vec2 t;
+            rawpreampGainGrid(uvec2(x, y), p.geometry.xy, galleryGain.secondaryShape.xy,
+                             galleryGain.secondaryAxes, a, b, t);
             uint stride = galleryGain.secondaryShape.x;
             uint start = galleryGain.secondaryShape.w;
             uint ia = start + a.y * stride + a.x;
@@ -260,9 +313,11 @@ uint packedCode(uint sampleIndex) {
     uint word = src.words[sampleIndex >> 1u];
     uint code = (sampleIndex & 1u) == 0u ? word & 65535u : word >> 16u;
 #endif
+#ifdef GALLERY_BAYER_PREPARE
     if (p.bayer.w != 0u && (bayerGain.header.w & 4u) != 0u)
         code = uint(bayerGain.values[bayerGain.lookup.y +
             min(code, bayerGain.lookup.z - 1u)]);
+#endif
     return code;
 #endif
 }
@@ -270,17 +325,14 @@ uint bayerColor(int x, int y) {
     uint shift = uint(((y & 1) * 2 + (x & 1)) * 2);
     return (p.bayer.z >> shift) & 3u;
 }
-uint bayerCode(int x, int y) {
-    uint raw = packedCode(uint(y) * p.bayer.x + uint(x));
-#ifdef SOURCE_TEXTURE
-    return raw;
-#else
-    if (p.bayer.w != 2u) return raw;
+#ifndef SOURCE_TEXTURE
+float bayerGainProduct(int x, int y) {
     uint phase = uint(((y & 1) << 1) | (x & 1));
     uint color = (bayerGain.header.w >> (8u + phase * 2u)) & 3u;
     uint sampleScale = max(1u, bayerGain.sourceGeometry.z);
     uvec2 sourcePixel = uvec2(x, y) * sampleScale;
-    if (sampleScale > 1u) sourcePixel += uvec2(x, y) & uvec2(1u);
+    if (sampleScale > 1u)
+        sourcePixel += (uvec2(x, y) & uvec2(1u)) * bayerGain.sourceGeometry.w;
     uvec2 sourceSize = bayerGain.sourceGeometry.xy;
     float gain = 1.0;
     for (uint mapIndex = 0u; mapIndex < bayerGain.header.x; ++mapIndex) {
@@ -293,11 +345,9 @@ uint bayerCode(int x, int y) {
             ((sourcePixel.y - bounds.y) % pitch.x != 0u ||
              (sourcePixel.x - bounds.x) % pitch.y != 0u)) continue;
         vec4 axes = bayerGain.axes[mapIndex];
-        vec2 grid = ((vec2(sourcePixel) + vec2(0.5)) / vec2(sourceSize) -
-                     axes.xy) / axes.zw;
-        vec2 base = floor(grid), fraction = clamp(grid - base, 0.0, 1.0);
-        uvec2 a = uvec2(clamp(base, vec2(0), vec2(shape.xy - uvec2(1))));
-        uvec2 b = min(a + uvec2(1), shape.xy - uvec2(1));
+        uvec2 a, b;
+        vec2 fraction;
+        rawpreampGainGrid(sourcePixel, sourceSize, shape.xy, axes, a, b, fraction);
         uint channel = shape.z == 1u ? 0u : shape.z == 3u ? color : phase;
         uint ia = shape.w + (a.y * shape.x + a.x) * shape.z + channel;
         uint ib = shape.w + (a.y * shape.x + b.x) * shape.z + channel;
@@ -307,6 +357,26 @@ uint bayerCode(int x, int y) {
             bayerGain.values[ia], bayerGain.values[ib],
             bayerGain.values[ic], bayerGain.values[id], fraction));
     }
+    return gain;
+}
+#endif
+uint bayerCode(int x, int y) {
+    uint raw = packedCode(uint(y) * p.bayer.x + uint(x));
+#if defined(SOURCE_TEXTURE) || !defined(GALLERY_BAYER_PREPARE)
+    // CFA gain/LUT/LOG work is completed by the preparation pass. Display
+    // variants consume prepared samples and must not retain those branches.
+    return raw;
+#else
+    if (p.bayer.w != 2u) return raw;
+    uint phase = uint(((y & 1) << 1) | (x & 1));
+#ifdef GALLERY_CACHED_GAIN
+    float gain = cachedGain.values[uint(y) * p.bayer.x + uint(x)];
+#else
+    float gain = bayerGainProduct(x, y);
+#ifdef GALLERY_CAPTURE_GAIN
+    cachedGain.values[uint(y) * p.bayer.x + uint(x)] = gain;
+#endif
+#endif
     float linear = (bayerGain.header.w & 2u) != 0u
         ? clamp(1.0 / gain, 0.0, 1.0) * 65535.0
         : (float(raw) - bayerGain.black[phase]) *
@@ -350,32 +420,139 @@ uint bayerAverage(int x, int y, uint channel) {
     }
     return (sum + valid / 2u) / valid;
 }
-uint sourceCode(uint sampleIndex) {
 #ifdef SOURCE_TEXTURE
-    // RGB textures cannot be Bayer sources. Exclude the unrolled demosaic
-    // branches from this shader instead of leaving them behind a uniform.
-    return packedCode(sampleIndex);
-#else
-    if (p.bayer.w == 0u) return packedCode(sampleIndex);
-    if (p.bayer.w == 3u) {
-        uint channel = sampleIndex % 3u;
-        float normalized = (float(packedCode(sampleIndex)) -
-            p.textureBlack[channel]) * p.textureInverseRange[channel];
-        return uint(floor(clamp(normalized, 0.0, 1.0) * 65535.0 + 0.5));
+// Fetch and normalize RGB once per pixel; gain coordinates and dither are
+// identical across channels. Keep the scalar implementation for measured A/B.
+vec3 textureGainProduct(uvec2 xy) {
+    uint x = xy.x, y = xy.y;
+    vec3 gain = vec3(1.0);
+    if (x >= galleryGain.bounds.x && y >= galleryGain.bounds.y &&
+        x < galleryGain.bounds.z && y < galleryGain.bounds.w) {
+        uvec2 a, b;
+        vec2 t;
+        rawpreampGainGrid(uvec2(x, y), p.geometry.xy, galleryGain.shape.xy,
+                         galleryGain.axes, a, b, t);
+        uint stride = galleryGain.shape.x * 3u;
+        uint ia = a.y * stride + a.x * 3u;
+        uint ib = a.y * stride + b.x * 3u;
+        uint ic = b.y * stride + a.x * 3u;
+        uint id = b.y * stride + b.x * 3u;
+        gain = RAWPREAMP_GAIN_BILERP(
+            vec3(galleryGain.values[ia], galleryGain.values[ia + 1u], galleryGain.values[ia + 2u]), vec3(galleryGain.values[ib], galleryGain.values[ib + 1u], galleryGain.values[ib + 2u]),
+            vec3(galleryGain.values[ic], galleryGain.values[ic + 1u], galleryGain.values[ic + 2u]), vec3(galleryGain.values[id], galleryGain.values[id + 1u], galleryGain.values[id + 2u]), t);
+        gain = vec3(rawpreampGainOrIdentity(gain.r),
+                    rawpreampGainOrIdentity(gain.g), rawpreampGainOrIdentity(gain.b));
     }
-    uint pixel = sampleIndex / 3u, channel = sampleIndex % 3u;
+    if (galleryGain.flags.z != 0u &&
+        x >= galleryGain.secondaryBounds.x && y >= galleryGain.secondaryBounds.y &&
+        x < galleryGain.secondaryBounds.z && y < galleryGain.secondaryBounds.w) {
+        uvec2 a, b;
+        vec2 t;
+        rawpreampGainGrid(uvec2(x, y), p.geometry.xy, galleryGain.secondaryShape.xy,
+                         galleryGain.secondaryAxes, a, b, t);
+        uint stride = galleryGain.secondaryShape.x;
+        uint start = galleryGain.secondaryShape.w;
+        uint ia = start + a.y * stride + a.x;
+        uint ib = start + a.y * stride + b.x;
+        uint ic = start + b.y * stride + a.x;
+        uint id = start + b.y * stride + b.x;
+        float luminance = RAWPREAMP_GAIN_BILERP(
+            galleryGain.values[ia], galleryGain.values[ib],
+            galleryGain.values[ic], galleryGain.values[id], t);
+        if (!isnan(luminance) && !isinf(luminance) && luminance > 0.0)
+            gain *= luminance;
+    }
+    return gain;
+}
+uvec3 textureCodes(uint pixel) {
+    ivec2 xy = ivec2(int(pixel % p.geometry.x), int(pixel / p.geometry.x));
+    vec3 code = floor(clamp(texelFetch(sourceImage, xy, 0).rgb,
+                             0.0, 1.0) * 65535.0 + 0.5);
+    vec3 normalized = (code - p.textureBlack.xyz) *
+        p.textureInverseRange.xyz;
+    if (galleryGain.shape.x != 0u) {
+        uint x = pixel % p.geometry.x, y = pixel / p.geometry.x;
+#ifdef GALLERY_CACHED_GAIN
+        uint at = pixel * 3u;
+        vec3 gain = vec3(cachedGain.values[at], cachedGain.values[at+1u], cachedGain.values[at+2u]);
+#else
+        vec3 gain = textureGainProduct(uvec2(x, y));
+#endif
+        vec3 linear = galleryGain.flags.w != 0u
+            ? floor(clamp(1.0 / gain, 0.0, 1.0) * 65535.0 + 0.5)
+            : floor(clamp(normalized * gain, 0.0, 1.0) * 65535.0 + 0.5);
+        if (galleryGain.shape.z == 0u) return uvec3(linear);
+        float dither = rawpreampDither(x, y, galleryGain.shape.w,
+                                      galleryGain.flags.x != 0u);
+        vec3 encoded = rawpreampLog60(linear / 65535.0, galleryGain.shape.z);
+        // One scalar sample is broadcast to RGB: the hash has no channel term.
+        uvec3 logCode = uvec3(floor(clamp(encoded + dither, 0.0,
+            float(galleryGain.shape.z)) + 0.5));
+        return uvec3(galleryGain.values[galleryGain.flags.y + logCode.r],
+                     galleryGain.values[galleryGain.flags.y + logCode.g],
+                     galleryGain.values[galleryGain.flags.y + logCode.b]);
+    }
+    return uvec3(floor(clamp(normalized, 0.0, 1.0) * 65535.0 + 0.5));
+}
+#endif
+uvec3 sourceCodes(uint pixel) {
+    uint first = pixel * 3u;
+#ifdef SOURCE_TEXTURE
+#ifndef GALLERY_RGB_SCALAR
+    return textureCodes(pixel);
+#else
+    return uvec3(packedCode(first), packedCode(first + 1u), packedCode(first + 2u));
+#endif
+#else
+    if (p.bayer.w == 0u)
+        return uvec3(packedCode(first), packedCode(first + 1u), packedCode(first + 2u));
+    if (p.bayer.w == 3u) {
+        vec3 raw = vec3(packedCode(first), packedCode(first + 1u), packedCode(first + 2u));
+        vec3 normalized = (raw - p.textureBlack.xyz) * p.textureInverseRange.xyz;
+        return uvec3(floor(clamp(normalized, vec3(0.0), vec3(1.0)) * 65535.0 + 0.5));
+    }
+    // Reconstruct RGB together so integer Bayer coordinate division is done
+    // once per output pixel, rather than once for every color component.
     int x = int(pixel % p.bayer.x), y = int(pixel / p.bayer.x);
-    float normalized = (float(bayerAverage(x, y, channel)) -
-        p.bayerBlack[channel]) * p.bayerInverseRange[channel];
-    return uint(floor(clamp(normalized, 0.0, 1.0) * 65535.0 + 0.5));
+    vec3 raw;
+#ifndef GALLERY_BAYER_LOOPS
+    // Fixed gathers avoid divergent neighbor loops. Clamp missing neighbors
+    // for safe loads, then mask them out to preserve the scalar edge average.
+    int right = min(x + 1, int(p.bayer.x) - 1);
+    int bottom = min(y + 1, int(p.bayer.y) - 1);
+    int left = max(x - 1, 0), top = max(y - 1, 0);
+    uint hasLeft = uint(x > 0), hasRight = uint(x + 1 < int(p.bayer.x));
+    uint hasTop = uint(y > 0), hasBottom = uint(y + 1 < int(p.bayer.y));
+    uint nx = hasLeft + hasRight, ny = hasTop + hasBottom;
+    uint center = bayerCode(x, y);
+    uint horizontal = bayerCode(left, y) * hasLeft + bayerCode(right, y) * hasRight;
+    uint vertical = bayerCode(x, top) * hasTop + bayerCode(x, bottom) * hasBottom;
+    uint h = (horizontal + nx / 2u) >> uint(nx == 2u);
+    uint v = (vertical + ny / 2u) >> uint(ny == 2u);
+    uint count = nx + ny;
+    uint crossSum = horizontal + vertical;
+    uint green = count == 4u ? (crossSum + 2u) >> 2u :
+                 count == 2u ? (crossSum + 1u) >> 1u : (crossSum + 1u) / 3u;
+    uint diagonal = bayerCode(left, top) * hasLeft * hasTop +
+                    bayerCode(right, top) * hasRight * hasTop +
+                    bayerCode(left, bottom) * hasLeft * hasBottom +
+                    bayerCode(right, bottom) * hasRight * hasBottom;
+    uint d = (diagonal + (nx * ny) / 2u) >> (uint(nx == 2u) + uint(ny == 2u));
+    uint native = bayerColor(x, y);
+    bool redHorizontal = bayerColor(x + 1, y) == 0u;
+    raw = vec3(native == 0u ? center : native == 1u ? (redHorizontal ? h : v) : d,
+               native == 1u ? center : green,
+               native == 2u ? center : native == 1u ? (redHorizontal ? v : h) : d);
+#else
+    raw = vec3(bayerAverage(x, y, 0u), bayerAverage(x, y, 1u), bayerAverage(x, y, 2u));
+#endif
+    vec3 normalized = (raw - p.bayerBlack.xyz) * p.bayerInverseRange.xyz;
+    return uvec3(floor(clamp(normalized, vec3(0.0), vec3(1.0)) * 65535.0 + 0.5));
 #endif
 }
 uint encode(float value) {
     uint index = uint(floor(clamp(value, 0.0, 1.0) * 65535.0 + 0.5));
-    float linear = float(index) / 65535.0;
-    float encoded = linear <= 0.0031308 ? linear * 12.92 :
-        1.055 * pow(linear, 1.0 / 2.4) - 0.055;
-    return uint(floor(clamp(encoded, 0.0, 1.0) * 65535.0 + 0.5));
+    return uint(profiles.values[profiles.offsets[0].w + index]);
 }
 float srgbEncode(float value) {
     value = max(0.0, value);
@@ -403,10 +580,21 @@ vec3 tableSample(uint table, float hue, float saturation, float value) {
     float h = wrappedHue(hue) * float(shape.x) / 360.0;
     float s = clamp(saturation, 0.0, 1.0) * float(shape.y - 1u);
     float v = shape.z > 1u ? clamp(value, 0.0, 1.0) * float(shape.z - 1u) : 0.0;
-    uint h0 = uint(h) % shape.x, h1 = (h0 + 1u) % shape.x;
+    uint h0 = uint(h) % shape.x, h1 = h0 + 1u;
+    if (h1 == shape.x) h1 = 0u;
     uint s0 = uint(s), s1 = min(s0 + 1u, shape.y - 1u);
     uint v0 = uint(v), v1 = min(v0 + 1u, shape.z - 1u);
     float hf = h - floor(h), sf = s - float(s0), vf = v - float(v0);
+#ifdef GALLERY_PROFILE_TEXTURES
+    vec3 lower = mix(
+        mix(profileTexel(table,v0,h0,s0), profileTexel(table,v0,h0,s1), sf),
+        mix(profileTexel(table,v0,h1,s0), profileTexel(table,v0,h1,s1), sf), hf);
+    if (v0 == v1) return lower;
+    vec3 upper = mix(
+        mix(profileTexel(table,v1,h0,s0), profileTexel(table,v1,h0,s1), sf),
+        mix(profileTexel(table,v1,h1,s0), profileTexel(table,v1,h1,s1), sf), hf);
+    return mix(lower, upper, vf);
+#else
     vec3 result;
     for (uint channel = 0u; channel < 3u; ++channel) {
         float lower = mix(
@@ -414,6 +602,10 @@ vec3 tableSample(uint table, float hue, float saturation, float value) {
                 tableValue(table, v0, h0, s1, channel), sf),
             mix(tableValue(table, v0, h1, s0, channel),
                 tableValue(table, v0, h1, s1, channel), sf), hf);
+        if (v0 == v1) {
+            result[channel] = lower;
+            continue;
+        }
         float upper = mix(
             mix(tableValue(table, v1, h0, s0, channel),
                 tableValue(table, v1, h0, s1, channel), sf),
@@ -422,6 +614,7 @@ vec3 tableSample(uint table, float hue, float saturation, float value) {
         result[channel] = mix(lower, upper, vf);
     }
     return result;
+#endif
 }
 vec3 rgbToHsv(vec3 rgb) {
     float maximum = max(max(rgb.r, rgb.g), max(rgb.b, 0.0));
@@ -504,9 +697,7 @@ vec3 applyProfiles(vec3 camera) {
          0.0719453 * xyz.x - 0.2289914 * xyz.y + 1.4052427 * xyz.z);
 }
 uvec3 transform(uint pixel) {
-    uint first = pixel * 3u;
-    uvec3 codes = uvec3(sourceCode(first), sourceCode(first + 1u),
-                        sourceCode(first + 2u));
+    uvec3 codes = sourceCodes(pixel);
     vec3 camera = vec3(codes) / 65535.0;
     vec3 display;
     if (p.dimensions.z == 2u) display = applyProfiles(camera);
@@ -552,8 +743,7 @@ uint sourcePixel(uint outputPixel) {
         return x * p.geometry.x + (p.geometry.x - 1u - y);
     return y * p.geometry.x + x;
 }
-uvec3 outputColor(uint outputPixel) {
-    uint source = sourcePixel(outputPixel);
+uvec3 outputColorFromSource(uint source) {
     uvec3 color = transform(source);
 #ifndef GALLERY_CLIPPING
     return color;
@@ -586,15 +776,64 @@ uvec3 outputColor(uint outputPixel) {
                  (bits & 4u) != 0u ? 65535u : 0u);
 #endif
 }
+uvec3 outputColor(uint outputPixel) {
+    return outputColorFromSource(sourcePixel(outputPixel));
+}
 void main() {
     uint group = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y *
         gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+#ifdef GALLERY_GAIN_FIELD
+    if (group < p.dimensions.x) {
+#ifdef SOURCE_TEXTURE
+        vec3 gain = textureGainProduct(uvec2(group % p.geometry.x, group / p.geometry.x));
+        dst.values[group*3u] = gain.r;
+        dst.values[group*3u+1u] = gain.g;
+        dst.values[group*3u+2u] = gain.b;
+#else
+        dst.values[group] = bayerGainProduct(int(group % p.bayer.x), int(group / p.bayer.x));
+#endif
+    }
+#else
+#if !defined(GALLERY_IMAGE_OUTPUT) && !defined(GALLERY_BAYER_PREPARE)
+    uint rowWidth = (p.geometry.z == 90u || p.geometry.z == 270u)
+        ? p.geometry.y : p.geometry.x;
+    uint perInvocation = (p.geometry.w & 13u) != 0u ? 4u : 2u;
+    if (p.thumbnail.z == 0u && (p.geometry.z == 90u || p.geometry.z == 270u) && rowWidth % perInvocation == 0u) {
+        uint columns = rowWidth / perInvocation;
+        uint gx = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x % 16u;
+        uint gy = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.x / 16u;
+        if (gx >= columns) return;
+        group = gy * columns + gx;
+    }
+#endif
+#ifdef GALLERY_BAYER_PREPARE
+    uint first = group * 2u;
+    if (first >= p.dimensions.x) return;
+    uint lo = bayerCode(int(first % p.bayer.x), int(first / p.bayer.x));
+    uint hi = first + 1u < p.dimensions.x
+        ? bayerCode(int((first + 1u) % p.bayer.x), int((first + 1u) / p.bayer.x)) : 0u;
+    dst.words[group] = lo | (hi << 16u);
+    return;
+#else
 #ifdef GALLERY_IMAGE_OUTPUT
-    if (group >= p.dimensions.x) return;
+    // Traverse source tiles so portrait rotation cannot turn every Bayer
+    // neighbour load into an uncached full-row stride.
+    uvec2 sourceXY = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(sourceXY, p.geometry.xy))) return;
     uint outputWidth = (p.geometry.z == 90u || p.geometry.z == 270u)
         ? p.geometry.y : p.geometry.x;
-    uvec3 color = outputColor(group);
-    ivec2 xy = ivec2(group % outputWidth, group / outputWidth);
+    uvec2 outputXY = sourceXY;
+    if (p.geometry.z == 90u) outputXY = uvec2(p.geometry.y - 1u - sourceXY.y, sourceXY.x);
+    else if (p.geometry.z == 180u) outputXY = p.geometry.xy - uvec2(1u) - sourceXY;
+    else if (p.geometry.z == 270u) outputXY = uvec2(sourceXY.y, p.geometry.x - 1u - sourceXY.x);
+#ifdef GALLERY_REPEAT_COORDINATES
+    uvec3 color = outputColor(outputXY.y * outputWidth + outputXY.x);
+#else
+    // This invocation already owns the source coordinate. Avoid converting
+    // to a rotated output index and dividing/rotating it back for sampling.
+    uvec3 color = outputColorFromSource(sourceXY.y * p.geometry.x + sourceXY.x);
+#endif
+    ivec2 xy = ivec2(outputXY);
 #ifdef GALLERY_IMAGE_RGB10A2
     imageStore(dstImage, xy, vec4(vec3(color) / 65535.0, 1.0));
 #else
@@ -652,22 +891,31 @@ void main() {
         } else dst.words[word + 1u] = a.z;
     }
 #endif
+#endif // GALLERY_BAYER_PREPARE
+#endif
 }
 )glsl";
 
 std::string galleryColorShader(bool textureSource, bool imageOutput = false,
                                bool imageRgb10a2 = false, bool bayerTexture = false,
-                               bool clipping = true) {
+                               bool clipping = true, bool prepareBayer = false, bool profileTextures = false,
+                               bool gainField = false, bool cachedGain = false, bool captureGain = false) {
     const char* newline = std::strchr(colorShader, '\n');
     if (!newline) return {};
     std::string source = textureSource
         ? std::string(colorShader, newline + 1) +
             "#define SOURCE_TEXTURE 1\n" + (newline + 1)
         : std::string(colorShader);
+    if (rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GALLERY_RGB_SCALAR"))
+        source.insert(source.find('\n') + 1, "#define GALLERY_RGB_SCALAR 1\n");
     if (bayerTexture) {
         source = std::string(colorShader);
         source.insert(source.find('\n') + 1, "#define SOURCE_BAYER_TEXTURE 1\n");
     }
+    if (rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GALLERY_BAYER_LOOPS"))
+        source.insert(source.find('\n') + 1, "#define GALLERY_BAYER_LOOPS 1\n");
+    if (imageOutput && rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GALLERY_REPEAT_COORDINATES"))
+        source.insert(source.find('\n') + 1, "#define GALLERY_REPEAT_COORDINATES 1\n");
     if (imageOutput) {
         const auto newlinePos = source.find('\n');
         source.insert(newlinePos + 1, "#define GALLERY_IMAGE_OUTPUT 1\n");
@@ -676,6 +924,16 @@ std::string galleryColorShader(bool textureSource, bool imageOutput = false,
     }
     if (clipping)
         source.insert(source.find('\n') + 1, "#define GALLERY_CLIPPING 1\n");
+    if (profileTextures)
+        source.insert(source.find('\n') + 1, "#define GALLERY_PROFILE_TEXTURES\n");
+    if (prepareBayer)
+        source.insert(source.find('\n') + 1, "#define GALLERY_BAYER_PREPARE 1\n");
+    if (gainField)
+        source.insert(source.find('\n') + 1, "#define GALLERY_GAIN_FIELD 1\n");
+    if (cachedGain)
+        source.insert(source.find('\n') + 1, "#define GALLERY_CACHED_GAIN 1\n");
+    if (captureGain)
+        source.insert(source.find('\n') + 1, "#define GALLERY_CAPTURE_GAIN 1\n");
     constexpr char marker[] = "// @DISPLAY_MATH@";
     const auto position = source.find(marker);
     if (position == std::string::npos) return {};
@@ -803,6 +1061,14 @@ struct Device {
     std::atomic_bool sharedTextureRejected{false};
     pl_pass pass = nullptr, colorPass = nullptr, unclippedColorPass = nullptr;
     pl_pass colorImagePass = nullptr, colorImage10Pass = nullptr;
+    pl_pass bayerPreparePass = nullptr, bayerPrepareCachedPass = nullptr, gainFieldPass = nullptr;
+    pl_pass bayerTexturePreparePass = nullptr, bayerTexturePrepareCachedPass = nullptr;
+    pl_pass bayerPrepareCapturePass = nullptr, bayerTexturePrepareCapturePass = nullptr;
+    VulkanSpatialGainCache spatialGains;
+    pl_pass comparePreparedPass = nullptr;
+    pl_buf comparePrepared = nullptr, compareResult = nullptr, compareStage = nullptr;
+    pl_buf preparedBayer = nullptr;
+    pl_timer prepareTimer = nullptr, colorTimer = nullptr;
     pl_buf source = nullptr, upload = nullptr, output = nullptr, download = nullptr;
     ThumbnailReadback thumbnailReadback;
     std::array<ThumbnailReadback,3> thumbnailReadbacks{};
@@ -811,7 +1077,46 @@ struct Device {
     pl_buf clipping = nullptr, clippingUpload = nullptr;
     size_t previousClippingBytes=0;
     pl_buf gain = nullptr, gainUpload = nullptr;
-    pl_buf emptyGain = nullptr;
+    VulkanUploadCache gainCache, profileCache;
+    pl_buf emptyGain = nullptr, srgbLookup = nullptr;
+    std::array<pl_pass,8> profileTexturePasses{};
+    std::array<pl_pass,2> cachedColorPasses{}, cachedColorImagePasses{};
+    bool profileTextureRejected = false;
+    struct ProfileTexture {
+        pl_tex image = nullptr;
+        std::vector<float> values;
+        uint32_t width = 0, height = 0, depth = 0;
+        bool update(pl_gpu gpu, const DNGProfileTable* table) {
+            const bool empty = !table || table->values.empty();
+            const uint32_t w = empty ? 1u : table->saturationDivisions;
+            const uint32_t h = empty ? 1u : table->hueDivisions;
+            const uint32_t d = empty ? 1u : table->valueDivisions;
+            if (std::max({w, h, d}) > gpu->limits.max_tex_3d_dim ||
+                uint64_t(w)*h*d > gpu->limits.max_ssbo_size / (4u*sizeof(float))) return false;
+            if (image && width == w && height == h && depth == d &&
+                (empty ? values.empty() : values == table->values)) return true;
+            const auto format = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
+            if (!format) return false;
+            std::vector<float> rgba(size_t(w) * h * d * 4u, 0.0f);
+            if (empty) rgba = {0, 1, 1, 0};
+            else for (size_t i = 0; i < table->values.size() / 3u; ++i)
+                std::copy_n(table->values.data() + i*3u, 3u, rgba.data() + i*4u);
+            width = height = depth = 0;
+            pl_tex_params params{};
+            params.w = w; params.h = h; params.d = d;
+            params.format = format; params.sampleable = params.host_writable = true;
+            if (!pl_tex_recreate(gpu, &image, &params)) return false;
+            pl_tex_transfer_params upload{};
+            upload.tex = image; upload.ptr = rgba.data();
+            if (!pl_tex_upload(gpu, &upload)) return false;
+            width = w;
+            height = h;
+            depth = d;
+            values = empty ? std::vector<float>{} : table->values;
+            return true;
+        }
+    };
+    std::array<ProfileTexture,2> profileTextures;
     std::vector<HostFrame> hostFrames;
     ~Device() {
         if (gpu) {
@@ -835,6 +1140,26 @@ struct Device {
             pl_buf_destroy(gpu, &gain);
             pl_buf_destroy(gpu, &gainUpload);
             pl_buf_destroy(gpu, &emptyGain);
+            pl_buf_destroy(gpu, &srgbLookup);
+            for (auto& profile : profileTextures) pl_tex_destroy(gpu, &profile.image);
+            for (auto& pass : profileTexturePasses) pl_pass_destroy(gpu, &pass);
+            for (auto& pass : cachedColorPasses) pl_pass_destroy(gpu, &pass);
+            for (auto& pass : cachedColorImagePasses) pl_pass_destroy(gpu, &pass);
+            pl_buf_destroy(gpu, &preparedBayer);
+            pl_pass_destroy(gpu, &bayerPreparePass);
+            pl_pass_destroy(gpu, &bayerPrepareCachedPass);
+            pl_pass_destroy(gpu, &bayerTexturePreparePass);
+            pl_pass_destroy(gpu, &bayerTexturePrepareCachedPass);
+            pl_pass_destroy(gpu, &bayerPrepareCapturePass);
+            pl_pass_destroy(gpu, &bayerTexturePrepareCapturePass);
+            pl_pass_destroy(gpu, &gainFieldPass);
+            spatialGains.reset();
+            pl_pass_destroy(gpu, &comparePreparedPass);
+            pl_buf_destroy(gpu, &comparePrepared);
+            pl_buf_destroy(gpu, &compareResult);
+            pl_buf_destroy(gpu, &compareStage);
+            pl_timer_destroy(gpu, &prepareTimer);
+            pl_timer_destroy(gpu, &colorTimer);
             pl_pass_destroy(gpu, &pass);
             pl_pass_destroy(gpu, &colorPass);
             pl_pass_destroy(gpu, &unclippedColorPass);
@@ -896,18 +1221,50 @@ struct Device {
         gainParams.initial_data = zero.data();
         emptyGain = pl_buf_create(gpu, &gainParams);
         if (!emptyGain) return false;
-
+        // Generate on the same GPU with the original transfer function. Only
+        // the quantized 16-bit input code indexes this immutable table.
+        pl_buf_params lookupParams{};
+        lookupParams.size = 65536u * sizeof(float);
+        lookupParams.storable = true;
+        lookupParams.memory_type = PL_BUF_MEM_DEVICE;
+        srgbLookup = pl_buf_create(gpu, &lookupParams);
+        if (!srgbLookup) return false;
+        pl_desc descriptor{"dst", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_WRITEONLY};
+        pl_pass_params params{};
+        params.type = PL_PASS_COMPUTE;
+        params.glsl_shader = srgbLookupShader;
+        params.descriptors = &descriptor; params.num_descriptors = 1;
+        pl_pass lookupPass = pl_pass_create(gpu, &params);
+        if (!lookupPass) return false;
+        pl_desc_binding binding{}; binding.object = srgbLookup;
+        pl_pass_run_params run{};
+        run.pass = lookupPass; run.desc_bindings = &binding;
+        run.compute_groups[0] = 256;
+        run.compute_groups[1] = run.compute_groups[2] = 1;
+        pl_pass_run(gpu, &run);
+        pl_pass_destroy(gpu, &lookupPass);
         return true;
     }
-    pl_pass ensureColorPass(bool clipping) {
-        auto& selected = clipping ? colorPass : unclippedColorPass;
-        if (!selected) selected = createColorPass(false, false, clipping);
+    pl_pass ensureColorPass(bool clipping, bool textured = false, bool cachedGain = false) {
+        if (textured && !profileTextureRejected) {
+            auto& pass = profileTexturePasses[(cachedGain ? 4 : 0) + (clipping ? 1 : 0)];
+            if (!pass && !rawpreamp::debugEnvironmentIsSet("RAWPREAMP_TEST_DCP_TEXTURE_FAIL"))
+                pass = createColorPass(false, false, clipping, false, true, false, cachedGain);
+            if (pass) return pass;
+            profileTextureRejected = true;
+        }
+        auto& selected = cachedGain ? cachedColorPasses[clipping ? 1 : 0]
+                                    : clipping ? colorPass : unclippedColorPass;
+        if (!selected) selected = createColorPass(false, false, clipping, false, false, false, cachedGain);
         return selected;
     }
-    pl_pass createColorPass(bool image = false, bool rgb10a2 = false, bool clipping = true) {
-        const bool sampled = textureSource;
-        const bool bayerTexture = bayerTextureSource;
-        pl_desc descriptors[5] = {};
+    pl_pass createColorPass(bool image = false, bool rgb10a2 = false, bool clipping = true,
+                            bool prepareBayer = false, bool profileTextures = false,
+                            bool field = false, bool cachedGain = false, bool textureBayerInput = false,
+                            bool captureGain = false) {
+        const bool sampled = textureSource || textureBayerInput;
+        const bool bayerTexture = bayerTextureSource || textureBayerInput;
+        pl_desc descriptors[8] = {};
         descriptors[0] = {sampled ? "sourceImage" : "src",
                           sampled ? PL_DESC_SAMPLED_TEX : PL_DESC_BUF_STORAGE,
                           0, PL_DESC_ACCESS_READONLY};
@@ -920,20 +1277,35 @@ struct Device {
                           3, PL_DESC_ACCESS_READONLY};
         descriptors[4] = {sampled && !bayerTexture ? "galleryGain" : "bayerGain", PL_DESC_BUF_STORAGE,
                           4, PL_DESC_ACCESS_READONLY};
-        const std::string source = galleryColorShader(sampled, image, rgb10a2, bayerTexture, clipping);
+        descriptors[5] = {"hueTexture", PL_DESC_SAMPLED_TEX, 5, PL_DESC_ACCESS_READONLY};
+        descriptors[6] = {"lookTexture", PL_DESC_SAMPLED_TEX, 6, PL_DESC_ACCESS_READONLY};
+        // A cached pass is used only with a complete field, never a placeholder.
+        if (cachedGain || captureGain)
+            descriptors[profileTextures ? 7 : 5] = {"cachedGain", PL_DESC_BUF_STORAGE, 7,
+                captureGain ? PL_DESC_ACCESS_WRITEONLY : PL_DESC_ACCESS_READONLY};
+        const std::string source = galleryColorShader(sampled, image, rgb10a2, bayerTexture,
+            clipping, prepareBayer, profileTextures, field, cachedGain, captureGain);
         if (source.empty()) return nullptr;
         pl_pass_params params = {};
         params.type = PL_PASS_COMPUTE;
         params.descriptors = descriptors;
-        params.num_descriptors = 5;
+        params.num_descriptors = (profileTextures ? 7 : 5) + ((cachedGain || captureGain) ? 1 : 0);
         params.push_constants_size = sizeof(ColorConstants);
         params.glsl_shader = source.c_str();
         return pl_pass_create(gpu, &params);
     }
-    pl_pass ensureColorImagePass(bool rgb10a2) {
-        auto& imagePass = rgb10a2 ? colorImage10Pass : colorImagePass;
+    pl_pass ensureColorImagePass(bool rgb10a2, bool textured = false, bool cachedGain = false) {
+        if (textured && !profileTextureRejected) {
+            auto& pass = profileTexturePasses[(cachedGain ? 4 : 0) + (rgb10a2 ? 3 : 2)];
+            if (!pass && !rawpreamp::debugEnvironmentIsSet("RAWPREAMP_TEST_DCP_TEXTURE_FAIL"))
+                pass = createColorPass(true, rgb10a2, true, false, true, false, cachedGain);
+            if (pass) return pass;
+            profileTextureRejected = true;
+        }
+        auto& imagePass = cachedGain ? cachedColorImagePasses[rgb10a2 ? 1 : 0]
+                                     : rgb10a2 ? colorImage10Pass : colorImagePass;
         if (!imagePass)
-            imagePass = createColorPass(true, rgb10a2);
+            imagePass = createColorPass(true, rgb10a2, true, false, false, false, cachedGain);
         return imagePass;
     }
     bool reserveOutput(size_t bytes) {
@@ -1057,6 +1429,7 @@ struct Device {
         return true;
     }
     bool reserveProfiles(size_t bytes) {
+        if (!profiles || profiles->params.size < bytes) profileCache.invalidate();
         if (bytes > gpu->limits.max_ssbo_size) return false;
         pl_buf_params params = {}, uploadParams = {};
         params.size = bytes;
@@ -1065,7 +1438,8 @@ struct Device {
         uploadParams.size = bytes;
         uploadParams.host_writable = true;
         uploadParams.memory_type = PL_BUF_MEM_HOST;
-        return pl_buf_recreate(gpu, &profiles, &params) &&
+        return ((profiles && profiles->params.size >= bytes) ||
+                pl_buf_recreate(gpu, &profiles, &params)) &&
             pl_buf_recreate(gpu, &profilesUpload, &uploadParams);
     }
     bool reserveClipping(size_t bytes) {
@@ -1081,6 +1455,7 @@ struct Device {
             pl_buf_recreate(gpu, &clippingUpload, &uploadParams);
     }
     bool reserveGain(size_t bytes) {
+        if (!gain || gain->params.size < bytes) gainCache.invalidate();
         if (bytes > gpu->limits.max_ssbo_size) return false;
         pl_buf_params params = {}, uploadParams = {};
         params.size = bytes;
@@ -1089,7 +1464,8 @@ struct Device {
         uploadParams.size = bytes;
         uploadParams.host_writable = true;
         uploadParams.memory_type = PL_BUF_MEM_HOST;
-        return pl_buf_recreate(gpu, &gain, &params) &&
+        return ((gain && gain->params.size >= bytes) ||
+                pl_buf_recreate(gpu, &gain, &params)) &&
             pl_buf_recreate(gpu, &gainUpload, &uploadParams);
     }
 };
@@ -1292,6 +1668,8 @@ bool colorGalleryRgbVulkan(
     // Falling back during warmup would compile it on a later playback frame.
     const bool residentSource = texture ||
         (bayer && bayer->gpu && (bayer->buffer || bayer->texture));
+    if (residentSource && rawpreamp::debugEnvironmentIsSet("RAWPREAMP_TEST_FAIL_GALLERY_COLOR"))
+        return false;
     if (warming.load() && !residentSource) {
         if (warmingFallback) *warmingFallback = true;
         return false;
@@ -1354,15 +1732,16 @@ bool colorGalleryRgbVulkan(
     const void* externalGpu = texture ? texture->gpu
         : bayer && (bayer->buffer || bayer->texture) ? bayer->gpu : nullptr;
     const bool bayerTexture = bayer && bayer->texture;
+    const bool prepareTextureBayer = bayerTexture && bayer->gain;
     const void* externalBuffer = texture ? texture->buffer
         : bayer ? bayer->buffer : nullptr;
     const size_t inputBytes = externalGpu ? 0u
         : bayer ? static_cast<size_t>(pixels) * 2u : rgb.size();
     std::lock_guard lock(deviceMutex);
     if (unavailable && !externalGpu) return false;
-    auto& selectedDevice = bayerTexture
+    auto& selectedDevice = bayerTexture && !prepareTextureBayer
         ? bayerTextureDevices[static_cast<pl_gpu>(externalGpu)]
-        : externalBuffer
+        : externalBuffer || prepareTextureBayer
         ? bufferDevices[static_cast<pl_gpu>(externalGpu)]
         : texture ? textureDevices[static_cast<pl_gpu>(externalGpu)] : device;
     if (texture && rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE")) {
@@ -1376,7 +1755,7 @@ bool colorGalleryRgbVulkan(
     }
     if (!selectedDevice) {
         auto candidate = std::make_shared<Device>();
-        if (!(externalGpu ? candidate->initExternal(static_cast<pl_gpu>(externalGpu), !externalBuffer, bayerTexture)
+        if (!(externalGpu ? candidate->initExternal(static_cast<pl_gpu>(externalGpu), !externalBuffer && !prepareTextureBayer, bayerTexture && !prepareTextureBayer)
                       : candidate->init())) {
             if (!texture) unavailable = true;
             return false;
@@ -1421,9 +1800,14 @@ bool colorGalleryRgbVulkan(
                  table->saturationDivisions * table->valueDivisions * 3u);
     };
     if (!validTable(hueSat) || !validTable(look)) return false;
-    const size_t profileBytes = 64u + (hueCount + lookCount) * sizeof(float);
+    const char* profileTextureOverride = rawpreamp::debugEnvironment("RAWPREAMP_DCP_TEXTURES");
+    const bool profileTextures = (!profileTextureOverride || std::strcmp(profileTextureOverride, "0") != 0) &&
+        !selected->profileTextureRejected && (hueCount || lookCount) && selected->profileTextures[0].update(selected->gpu, hueSat) &&
+        selected->profileTextures[1].update(selected->gpu, look);
+    const size_t profilePayloadBytes = 64u + (hueCount + lookCount) * sizeof(float);
+    const size_t profileBytes = profilePayloadBytes + 65536u * sizeof(float);
     if (!selected->reserveProfiles(profileBytes)) return false;
-    std::vector<uint8_t> profileData(profileBytes);
+    std::vector<uint8_t> profileData(profilePayloadBytes);
     auto writeTable = [&](const DNGProfileTable* table, size_t index,
                           uint32_t offset) {
         if (!table || table->values.empty()) return;
@@ -1440,10 +1824,13 @@ bool colorGalleryRgbVulkan(
     };
     writeTable(hueSat, 0u, 0u);
     writeTable(look, 1u, static_cast<uint32_t>(hueCount));
-    pl_buf_write(selected->gpu, selected->profilesUpload, 0,
-                 profileData.data(), profileBytes);
-    pl_buf_copy(selected->gpu, selected->profiles, 0,
-                selected->profilesUpload, 0, profileBytes);
+    const uint32_t transferOffset = static_cast<uint32_t>(hueCount + lookCount);
+    std::memcpy(profileData.data() + 44u, &transferOffset, sizeof(transferOffset));
+    if (selected->profileCache.upload(selected->gpu, selected->profiles,
+            selected->profilesUpload, profileData.data(), profilePayloadBytes))
+        pl_buf_copy(selected->gpu, selected->profiles, profilePayloadBytes,
+                    selected->srgbLookup, 0, 65536u * sizeof(float));
+    std::vector<uint8_t> spatialGainKey;
     if (bayer && bayer->gain) {
         const auto* gain = bayer->gain;
         if (gain->maps.size() > 32) return false;
@@ -1482,7 +1869,7 @@ bool colorGalleryRgbVulkan(
         const uint32_t sourceGeometry[4] = {
             gain->sourceWidth ? gain->sourceWidth : bayer->width,
             gain->sourceHeight ? gain->sourceHeight : bayer->height,
-            std::max(1u, gain->sourceScale), 0u};
+            std::max(1u, gain->sourceScale), gain->sourceParityOffset};
         std::memcpy(data.data() + 64u, sourceGeometry, sizeof(sourceGeometry));
         uint32_t offset = 0;
         for (size_t index = 0; index < gain->maps.size(); ++index) {
@@ -1504,7 +1891,7 @@ bool colorGalleryRgbVulkan(
             offset += static_cast<uint32_t>(map.values.size());
         }
         if (lookup) {
-            const auto table = makeLog60LinearizationTable(
+            const auto& table = cachedLog60LinearizationTable(
                 static_cast<uint16_t>(gain->encodedWhite));
             for (size_t index = 0; index < lookup; ++index) {
                 const float code = static_cast<float>(table[index]);
@@ -1524,10 +1911,26 @@ bool colorGalleryRgbVulkan(
                 (values + lookup + sourceLookup) * sizeof(float),
                 table.data(), table.size() * sizeof(float));
         }
-        pl_buf_write(selected->gpu, selected->gainUpload, 0,
-                     data.data(), gainBytes);
-        pl_buf_copy(selected->gpu, selected->gain, 0,
-                    selected->gainUpload, 0, gainBytes);
+        selected->gainCache.upload(selected->gpu, selected->gain,
+            selected->gainUpload, data.data(), gainBytes);
+        if (
+            !rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GAIN_FIELD_DISABLE") &&
+            size_t(pixels) * sizeof(float) <= std::min<size_t>(64u * 1024u * 1024u,
+                selected->gpu->limits.max_ssbo_size) &&
+            std::any_of(gain->maps.begin(), gain->maps.end(), [](const auto& map) {
+                return map.width > 1 || map.height > 1;
+            })) {
+            // Only spatial inputs belong in this key. Levels, LOG and dither
+            // still run every frame and must not invalidate the gain product.
+            const uint32_t shape[] = {bayer->width, bayer->height, packedPhase,
+                                     static_cast<uint32_t>(gain->maps.size())};
+            spatialGainKey.resize(sizeof(shape) + sizeof(sourceGeometry) +
+                                  headerBytes - 80u + values * sizeof(float));
+            auto* out = spatialGainKey.data();
+            std::memcpy(out, shape, sizeof(shape)); out += sizeof(shape);
+            std::memcpy(out, sourceGeometry, sizeof(sourceGeometry)); out += sizeof(sourceGeometry);
+            std::memcpy(out, data.data() + 80u, headerBytes - 80u + values * sizeof(float));
+        }
     }
     if (texture && !externalBuffer) {
         const auto* gain = texture->gain;
@@ -1570,7 +1973,7 @@ bool colorGalleryRgbVulkan(
                     gain->secondaryValues.data(),
                     gain->secondaryValues.size() * sizeof(float));
             if (lookup) {
-                const auto linearization = makeLog60LinearizationTable(gain->encodedWhite);
+                const auto& linearization = cachedLog60LinearizationTable(gain->encodedWhite);
                 for (size_t index = 0; index < lookup; ++index) {
                     const float code = static_cast<float>(linearization[index]);
                     std::memcpy(data.data() + 112 + (values + index) * sizeof(float),
@@ -1578,11 +1981,19 @@ bool colorGalleryRgbVulkan(
                 }
             }
         }
-        pl_buf_write(selected->gpu, selected->gainUpload, 0,
-                     data.data(), gainBytes);
-        pl_buf_copy(selected->gpu, selected->gain, 0,
-                    selected->gainUpload, 0, gainBytes);
+        selected->gainCache.upload(selected->gpu, selected->gain,
+            selected->gainUpload, data.data(), gainBytes);
+        if (gain && (gain->width > 1 || gain->height > 1 ||
+                     gain->secondaryWidth > 1 || gain->secondaryHeight > 1)) {
+            spatialGainKey.assign(data.begin(), data.begin() + 112u + values * sizeof(float));
+            std::fill(spatialGainKey.begin() + 8, spatialGainKey.begin() + 16, 0);
+            std::fill(spatialGainKey.begin() + 48, spatialGainKey.begin() + 64, 0);
+            const uint32_t geometry[] = {sourceWidth, sourceHeight};
+            const auto bytes = reinterpret_cast<const uint8_t*>(geometry);
+            spatialGainKey.insert(spatialGainKey.end(), bytes, bytes + sizeof(geometry));
+        }
     }
+    if (spatialGainKey.empty()) selected->spatialGains.reset();
     if (!externalGpu) {
         const auto* input = bayer
             ? reinterpret_cast<const uint8_t*>(bayer->samples) : rgb.data();
@@ -1642,7 +2053,7 @@ bool colorGalleryRgbVulkan(
         constants.textureInverseRange[channel] = static_cast<float>(
             1.0 / (texture->white[channel] - texture->black[channel]));
     }
-    pl_desc_binding bindings[5] = {};
+    pl_desc_binding bindings[8] = {};
     pl_buf exported = nullptr;
     bool sharedTexture = false;
     bool sharedImage10 = rgb10a2;
@@ -1656,13 +2067,13 @@ bool colorGalleryRgbVulkan(
     if (output && output->gpuBuffer && rgb24 && !selected->sharedTextureRejected &&
         pl_vulkan_get(selected->gpu) && sharedVulkanDevice() &&
         pl_vulkan_get(selected->gpu)->device == sharedVulkanDevice()->device) {
-        if (selected->ensureColorImagePass(sharedImage10))
+        if (selected->ensureColorImagePass(sharedImage10, profileTextures))
             frameOutputTexture = selected->createOutputTexture(outputWidth, outputHeight, sharedImage10);
         // A driver may sample packed 10-bit images without supporting storage
         // writes. Keep the shared transport and use RGBA8 in that case.
         if (!frameOutputTexture && sharedImage10) {
             sharedImage10 = false;
-            if (selected->ensureColorImagePass(false))
+            if (selected->ensureColorImagePass(false, profileTextures))
                 frameOutputTexture = selected->createOutputTexture(outputWidth, outputHeight, false);
         }
         sharedTexture = frameOutputTexture != nullptr;
@@ -1695,7 +2106,7 @@ bool colorGalleryRgbVulkan(
         if (exported) pl_buf_destroy(selected->gpu, &exported);
         return false;
     }
-    if (!sharedTexture && !selected->ensureColorPass(bool(clip))) {
+    if (!sharedTexture && !selected->ensureColorPass(bool(clip), profileTextures)) {
         if (exported) pl_buf_destroy(selected->gpu, &exported);
         return false;
     }
@@ -1713,10 +2124,14 @@ bool colorGalleryRgbVulkan(
     bindings[3].object = selected->clipping;
     bindings[4].object = (texture && texture->gain) || (bayer && bayer->gain)
         ? selected->gain : selected->emptyGain;
+    if (profileTextures) for (size_t i=0;i<2;++i) {
+        bindings[5+i].object = selected->profileTextures[i].image;
+        bindings[5+i].sample_mode = PL_TEX_SAMPLE_NEAREST;
+    }
     pl_pass_run_params run = {};
     run.pass = sharedTexture
-        ? (sharedImage10 ? selected->colorImage10Pass : selected->colorImagePass)
-        : selected->ensureColorPass(bool(clip));
+        ? selected->ensureColorImagePass(sharedImage10, profileTextures)
+        : selected->ensureColorPass(bool(clip), profileTextures);
     run.desc_bindings = bindings;
     run.push_constants = &constants;
     const uint32_t pixelsPerInvocation = sharedTexture ? 1u : rgb24 ? 4u : 2u;
@@ -1725,17 +2140,228 @@ bool colorGalleryRgbVulkan(
     run.compute_groups[0] = std::min(groups, selected->gpu->limits.max_dispatch[0]);
     run.compute_groups[1] = (groups + run.compute_groups[0] - 1u) / run.compute_groups[0];
     run.compute_groups[2] = 1;
+    if (sharedTexture) {
+        run.compute_groups[0] = (sourceWidth + 15u) / 16u;
+        run.compute_groups[1] = (sourceHeight + 15u) / 16u;
+    } else if ((orientation == 90 || orientation == 270) && outputWidth % pixelsPerInvocation == 0u) {
+        run.compute_groups[0] = (outputWidth / pixelsPerInvocation + 15u) / 16u;
+        run.compute_groups[1] = (outputHeight + 15u) / 16u;
+    }
     if (run.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) {
         pl_tex_destroy(selected->gpu, &frameOutputTexture);
         if (exported) pl_buf_destroy(selected->gpu, &exported);
         return false;
     }
+    const bool profileStages = rawpreamp::debugEnvironment("RAWPREAMP_RAW_GPU_TIMERS");
+    if (profileStages) {
+        if (!selected->prepareTimer) selected->prepareTimer = pl_timer_create(selected->gpu);
+        if (!selected->colorTimer) selected->colorTimer = pl_timer_create(selected->gpu);
+        uint64_t ns;
+        while ((ns = pl_timer_query(selected->gpu, selected->prepareTimer)))
+            spdlog::info("GALLERY_PERF event=gallery_gpu_stage stage=bayer_prepare elapsed_ms={:.3f}", ns / 1e6);
+        while ((ns = pl_timer_query(selected->gpu, selected->colorTimer)))
+            spdlog::info("GALLERY_PERF event=gallery_gpu_stage stage=color elapsed_ms={:.3f}", ns / 1e6);
+        run.timer = selected->colorTimer;
+    }
+    // Bake once per CFA sample, rather than repeating gain-map interpolation,
+    // dithering and LOG lookup at every demosaic neighbour. The intermediate
+    // stays on this device and is consumed directly by the color pass.
+    if (bayer && bayer->gain) {
+        auto& uncachedPrepare = prepareTextureBayer ? selected->bayerTexturePreparePass : selected->bayerPreparePass;
+        auto& cachedPrepare = prepareTextureBayer ? selected->bayerTexturePrepareCachedPass : selected->bayerPrepareCachedPass;
+        if (!uncachedPrepare)
+            uncachedPrepare = selected->createColorPass(false, false, false, true, false, false, false, prepareTextureBayer);
+        pl_buf_params preparedParams{};
+        preparedParams.size = ((size_t(pixels) + 1u) / 2u) * sizeof(uint32_t);
+        preparedParams.storable = true;
+        preparedParams.memory_type = PL_BUF_MEM_DEVICE;
+        if (!uncachedPrepare ||
+            !pl_buf_recreate(selected->gpu, &selected->preparedBayer, &preparedParams)) {
+            pl_tex_destroy(selected->gpu, &frameOutputTexture);
+            if (exported) pl_buf_destroy(selected->gpu, &exported);
+            return false;
+        }
+        std::array<pl_desc_binding, 8> prepareBindings;
+        std::copy(std::begin(bindings), std::end(bindings), prepareBindings.begin());
+        prepareBindings[1].object = selected->preparedBayer;
+        bool capturedThisFrame = false;
+        const bool captureGains = !rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GAIN_FIELD_CAPTURE_DISABLE");
+        auto gainField = selected->spatialGains.acquire(selected->gpu, spatialGainKey,
+            size_t(pixels) * sizeof(float), 1u, [&](pl_buf target) {
+                if (captureGains) {
+                    auto& capturePass = prepareTextureBayer ? selected->bayerTexturePrepareCapturePass
+                                                            : selected->bayerPrepareCapturePass;
+                    if (!capturePass)
+                        capturePass = selected->createColorPass(false, false, false, true, false,
+                            false, false, prepareTextureBayer, true);
+                    if (!cachedPrepare)
+                        cachedPrepare = selected->createColorPass(false, false, false, true, false,
+                            false, true, prepareTextureBayer);
+                    if (!capturePass || !cachedPrepare) return false;
+                    auto captureBindings = prepareBindings;
+                    captureBindings[5].object = target;
+                    auto captureRun = run;
+                    captureRun.pass = capturePass;
+                    captureRun.timer = profileStages ? selected->prepareTimer : nullptr;
+                    captureRun.desc_bindings = captureBindings.data();
+                    const uint32_t groups = ((pixels + 1u) / 2u + 255u) / 256u;
+                    captureRun.compute_groups[0] = std::min(groups, selected->gpu->limits.max_dispatch[0]);
+                    captureRun.compute_groups[1] = (groups + captureRun.compute_groups[0] - 1u) / captureRun.compute_groups[0];
+                    captureRun.compute_groups[2] = 1;
+                    if (captureRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) return false;
+                    pl_pass_run(selected->gpu, &captureRun);
+                    capturedThisFrame = true;
+                    return true;
+                }
+                if (!selected->gainFieldPass)
+                    selected->gainFieldPass = selected->createColorPass(false, false, false, false, false, true);
+                if (!cachedPrepare)
+                    cachedPrepare = selected->createColorPass(false, false, false, true, false, false, true, prepareTextureBayer);
+                if (!selected->gainFieldPass || !cachedPrepare) return false;
+                auto fieldBindings = prepareBindings;
+                fieldBindings[0].object = selected->preparedBayer;
+                fieldBindings[1].object = target;
+                auto fieldRun = run;
+                fieldRun.pass = selected->gainFieldPass;
+                fieldRun.timer = nullptr;
+                fieldRun.desc_bindings = fieldBindings.data();
+                const uint32_t fieldGroups = (pixels + 255u) / 256u;
+                fieldRun.compute_groups[0] = std::min(fieldGroups, selected->gpu->limits.max_dispatch[0]);
+                fieldRun.compute_groups[1] = (fieldGroups + fieldRun.compute_groups[0] - 1u) / fieldRun.compute_groups[0];
+                fieldRun.compute_groups[2] = 1;
+                if (fieldRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) return false;
+                pl_pass_run(selected->gpu, &fieldRun);
+                return true;
+            }, captureGains);
+        // A buffer and a texture can share a field on this device. Ensure the
+        // consuming variant even when this source type did not build the field.
+        if (gainField && !cachedPrepare)
+            cachedPrepare = selected->createColorPass(false, false, false, true, false,
+                false, true, prepareTextureBayer);
+        const bool cachedSpatialGain = gainField && cachedPrepare;
+        if (cachedSpatialGain) prepareBindings[5].object = gainField;
+        if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
+            spdlog::info("GALLERY_PERF event=gallery_gain_field cached={} bytes={}",
+                         cachedSpatialGain, cachedSpatialGain ? size_t(pixels) * sizeof(float) : 0u);
+        auto prepareRun = run;
+        prepareRun.pass = cachedSpatialGain ? cachedPrepare : uncachedPrepare;
+        prepareRun.timer = profileStages ? selected->prepareTimer : nullptr;
+        prepareRun.desc_bindings = prepareBindings.data();
+        const uint32_t prepareGroups = ((pixels + 1u) / 2u + 255u) / 256u;
+        prepareRun.compute_groups[0] = std::min(prepareGroups, selected->gpu->limits.max_dispatch[0]);
+        prepareRun.compute_groups[1] = (prepareGroups + prepareRun.compute_groups[0] - 1u) /
+            prepareRun.compute_groups[0];
+        if (prepareRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) {
+            pl_tex_destroy(selected->gpu, &frameOutputTexture);
+            if (exported) pl_buf_destroy(selected->gpu, &exported);
+            return false;
+        }
+        if (!capturedThisFrame) pl_pass_run(selected->gpu, &prepareRun);
+        if (cachedSpatialGain && rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GAIN_FIELD_VERIFY")) {
+            if (!selected->comparePreparedPass) {
+                pl_desc descriptors[] = {
+                    {"a", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
+                    {"b", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
+                    {"result", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_READWRITE}};
+                pl_pass_params params{};
+                params.type = PL_PASS_COMPUTE;
+                params.glsl_shader = comparePreparedShader;
+                params.descriptors = descriptors; params.num_descriptors = 3;
+                params.push_constants_size = sizeof(uint32_t);
+                selected->comparePreparedPass = pl_pass_create(selected->gpu, &params);
+            }
+            pl_buf_params resultParams{};
+            resultParams.size = 2u * sizeof(uint32_t); resultParams.storable = true;
+            pl_buf_params stageParams{};
+            stageParams.size = resultParams.size;
+            stageParams.host_writable = stageParams.host_readable = true;
+            if (!selected->comparePreparedPass ||
+                !pl_buf_recreate(selected->gpu, &selected->comparePrepared, &preparedParams) ||
+                !pl_buf_recreate(selected->gpu, &selected->compareResult, &resultParams) ||
+                !pl_buf_recreate(selected->gpu, &selected->compareStage, &stageParams)) {
+                pl_tex_destroy(selected->gpu, &frameOutputTexture);
+                if (exported) pl_buf_destroy(selected->gpu, &exported);
+                return false;
+            }
+            const uint32_t zero[2] = {0,0};
+            pl_buf_write(selected->gpu, selected->compareStage, 0, zero, sizeof(zero));
+            pl_buf_copy(selected->gpu, selected->compareResult, 0, selected->compareStage, 0, sizeof(zero));
+            auto referenceBindings = prepareBindings;
+            referenceBindings[1].object = selected->comparePrepared;
+            auto referenceRun = prepareRun;
+            referenceRun.pass = uncachedPrepare;
+            referenceRun.timer = nullptr;
+            referenceRun.desc_bindings = referenceBindings.data();
+            pl_pass_run(selected->gpu, &referenceRun);
+            pl_desc_binding compareBindings[3]{};
+            compareBindings[0].object = selected->preparedBayer;
+            compareBindings[1].object = selected->comparePrepared;
+            compareBindings[2].object = selected->compareResult;
+            auto compareRun = prepareRun;
+            compareRun.pass = selected->comparePreparedPass;
+            compareRun.timer = nullptr;
+            compareRun.desc_bindings = compareBindings;
+            uint32_t compareSamples = pixels;
+            compareRun.push_constants = &compareSamples;
+            pl_pass_run(selected->gpu, &compareRun);
+            pl_buf_copy(selected->gpu, selected->compareStage, 0, selected->compareResult, 0, sizeof(zero));
+            uint32_t result[2]{};
+            const bool read = pl_buf_read(selected->gpu, selected->compareStage, 0, result, sizeof(result));
+            spdlog::info("GALLERY_PERF event=gain_field_verify samples={} max_difference={} different={}",
+                         pixels, result[0], result[1]);
+            if (!read || result[0] != 0) {
+                pl_tex_destroy(selected->gpu, &frameOutputTexture);
+                if (exported) pl_buf_destroy(selected->gpu, &exported);
+                return false;
+            }
+        }
+        bindings[0].object = selected->preparedBayer;
+        bindings[4].object = selected->emptyGain;
+        constants.bayer[3] = 1u;
+    }
+    pl_buf rgbGainField = nullptr;
+    if (texture && !externalBuffer && texture->gain) {
+        auto field = selected->spatialGains.acquire(selected->gpu, spatialGainKey,
+            size_t(pixels) * 3u * sizeof(float), 3u, [&](pl_buf target) {
+                if (!selected->gainFieldPass)
+                    selected->gainFieldPass = selected->createColorPass(false, false, false, false, false, true);
+                if (!selected->gainFieldPass) return false;
+                auto fieldBindings = std::array<pl_desc_binding,8>{};
+                std::copy(std::begin(bindings), std::end(bindings), fieldBindings.begin());
+                fieldBindings[1].object = target;
+                auto fieldRun = run;
+                fieldRun.pass = selected->gainFieldPass; fieldRun.timer = nullptr;
+                fieldRun.desc_bindings = fieldBindings.data();
+                const uint32_t groups = (pixels + 255u) / 256u;
+                fieldRun.compute_groups[0] = std::min(groups, selected->gpu->limits.max_dispatch[0]);
+                fieldRun.compute_groups[1] = (groups + fieldRun.compute_groups[0] - 1u) / fieldRun.compute_groups[0];
+                fieldRun.compute_groups[2] = 1;
+                if (fieldRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) return false;
+                pl_pass_run(selected->gpu, &fieldRun);
+                return true;
+            });
+        if (field) {
+            const auto cachedPass = sharedTexture
+                ? selected->ensureColorImagePass(sharedImage10, profileTextures, true)
+                : selected->ensureColorPass(bool(clip), profileTextures, true);
+            if (cachedPass) {
+                const size_t fieldBinding = profileTextures && !selected->profileTextureRejected ? 7u : 5u;
+                bindings[fieldBinding].object = field;
+                run.pass = cachedPass;
+                rgbGainField = field;
+            }
+        }
+    }
     Device::ThumbnailReadback* scheduledThumbnail=nullptr;
     size_t scheduledThumbnailBytes=0;
     int scheduledThumbnailFrame=-1;
     ColorConstants scheduledThumbnailConstants{};
-    std::array<pl_desc_binding,5> scheduledThumbnailBindings{};
+    std::array<pl_desc_binding,8> scheduledThumbnailBindings{};
     pl_pass_run_params scheduledThumbnailRun{};
+    if ((hueCount || lookCount) && rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
+        spdlog::info("GALLERY_PERF event=gallery_dcp_sampling backend={} hue_points={} look_points={}",
+            profileTextures && !selected->profileTextureRejected ? "texture" : "buffer",
+            hueCount/3u, lookCount/3u);
     pl_pass_run(selected->gpu, &run);
     if (exported && exportNeedsCopy)
         pl_buf_copy(selected->gpu, exported, 0, selected->output, 0, paddedOutput);
@@ -1790,7 +2416,10 @@ bool colorGalleryRgbVulkan(
                     }
                 }
             }
-            if (slot && selected->ensureColorPass(bool(clip)) && selected->reserveThumbnail(*slot, padded)) {
+            const auto thumbnailPass = slot
+                ? selected->ensureColorPass(bool(clip), profileTextures, rgbGainField != nullptr)
+                : nullptr;
+            if (thumbnailPass && selected->reserveThumbnail(*slot, padded)) {
                 scheduledThumbnailConstants = constants;
                 auto& c = scheduledThumbnailConstants;
                 c.dimensions[0] = static_cast<uint32_t>(count);
@@ -1803,8 +2432,15 @@ bool colorGalleryRgbVulkan(
                 std::copy(std::begin(bindings), std::end(bindings),
                           scheduledThumbnailBindings.begin());
                 scheduledThumbnailBindings[1].object = slot->output;
+                if (rgbGainField) {
+                    // Thumbnail shader creation can reject DCP textures after
+                    // the image shader succeeded. Bind for the selected pass.
+                    const size_t fieldBinding = profileTextures && !selected->profileTextureRejected ? 7u : 5u;
+                    scheduledThumbnailBindings[fieldBinding].object = rgbGainField;
+                }
                 scheduledThumbnailRun = run;
-                scheduledThumbnailRun.pass = selected->ensureColorPass(bool(clip));
+                scheduledThumbnailRun.timer = nullptr;
+                scheduledThumbnailRun.pass = thumbnailPass;
                 scheduledThumbnailRun.desc_bindings = scheduledThumbnailBindings.data();
                 scheduledThumbnailRun.push_constants = &scheduledThumbnailConstants;
                 scheduledThumbnailRun.compute_groups[0] = static_cast<int>(
@@ -1956,6 +2592,9 @@ bool colorGalleryRgbVulkan(
             pl_buf releaseBuffer = buffer;
             pl_buf_destroy(owner->gpu, &releaseBuffer);
         };
+        if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
+            spdlog::info("GALLERY_PERF event=gallery_dma_buf width={} height={} direct={} resident_input={}",
+                gpuFrame->width, gpuFrame->height, !exportNeedsCopy, externalGpu != nullptr);
         *output->gpuBuffer = std::move(gpuFrame);
         rgb.clear();
         return true;

@@ -917,9 +917,7 @@ namespace {
                 throw std::runtime_error("Could not recover Native Video gallery preview");
             if (texture->gain) {
                 const auto& map = *texture->gain;
-                const auto linearization = map.encodedWhite
-                    ? rawpreamp::makeLog60LinearizationTable(map.encodedWhite)
-                    : std::vector<uint16_t>{};
+                const auto& linearization = rawpreamp::cachedLog60LinearizationTable(map.encodedWhite);
                 const auto* logLookup = map.encodedWhite
                     ? &rawpreamp::cachedLog60EncodeLookup(
                         0.0, 65535.0, static_cast<uint16_t>(map.encodedWhite))
@@ -1134,7 +1132,7 @@ namespace {
         convertRange(0, pixelCount / workers);
         for (auto& thread : threads) thread.join();
         if (rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GALLERY_PERF_PROFILE"))
-            spdlog::info("GALLERY_PERF event=gallery_color_stage pixels={} tables={} workers={} elapsed_ms={:.3f}",
+            spdlog::info("GALLERY_PERF event=gallery_color_stage pixels={} tables={} gpu=false workers={} elapsed_ms={:.3f}",
                 pixelCount, useProfileTables, workers,
                 std::chrono::duration<double, std::milli>(
                     rawpreamp::diagnosticNow() - transformStarted).count());

@@ -21,7 +21,14 @@ layout(std430, binding = 1) readonly buffer GainMaps {
     float gains[];
 } gainMaps;
 #endif
+#ifdef SPATIAL_GAIN_BUILD
+layout(std430, binding = 2) writeonly buffer Destination { float values[]; } dst;
+#else
 layout(std430, binding = 2) writeonly buffer Destination { uint words[]; } dst;
+#endif
+#ifdef SPATIAL_GAIN_USE
+layout(std430, binding = 4) readonly buffer SpatialGain { float values[]; } spatialGain;
+#endif
 layout(std430, binding = 3) readonly buffer Linearization { uint values[]; } linearization;
 layout(push_constant) uniform Constants {
     vec4 black;
@@ -38,7 +45,7 @@ layout(push_constant) uniform Constants {
 } p;
 // @GAIN_MULTI@
 #ifndef MULTI_MAP
-float gainAt(uint x, uint y) {
+float uncachedGainAt(uint x, uint y) {
     uint phase = ((y & 1u) << 1u) | (x & 1u);
     uint index = p.mapShape.z == 4u ? phase : 0u;
     bool fourPlane = (p.flags & 8u) != 0u;
@@ -62,11 +69,18 @@ float gainAt(uint x, uint y) {
     return !isnan(gain) && !isinf(gain) && gain > 0.0 ? gain : 1.0;
 }
 #else
-float gainAt(uint x, uint y) {
+float uncachedGainAt(uint x, uint y) {
     uint phase = ((y & 1u) << 1u) | (x & 1u);
     return multiGainAt(x, y, phase, false);
 }
 #endif
+float gainAt(uint x, uint y) {
+#ifdef SPATIAL_GAIN_USE
+    return spatialGain.values[y * p.dimensions.x + x];
+#else
+    return uncachedGainAt(x, y);
+#endif
+}
 // @GAIN_COMMON@
 uint inputSample(uint index) {
 #ifdef SOURCE_TEXTURE
@@ -101,6 +115,12 @@ uint codeAt(uint y, uint x) {
     return uint(floor(clamp(value, 0.0, maximum) + 0.5));
 }
 void main() {
+#ifdef SPATIAL_GAIN_BUILD
+    uint index = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (index >= p.dimensions.x * p.dimensions.y) return;
+    uint x = index % p.dimensions.x, y = index / p.dimensions.x;
+    dst.values[index] = uncachedGainAt(x, y);
+#else
     uint wordInRow = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
     if (y >= p.dimensions.y || wordInRow >= p.wordsPerRow) return;
@@ -111,6 +131,31 @@ void main() {
         uint a = first < rowSamples ? codeAt(y, first) : 0u;
         uint b = first + 1u < rowSamples ? codeAt(y, first + 1u) : 0u;
         dst.words[wordIndex] = a | (b << 16);
+        return;
+    }
+    if (p.dimensions.w == 8u) {
+        uint first = wordInRow * 4u;
+        uint a = first < rowSamples ? codeAt(y, first) : 0u;
+        uint b = first + 1u < rowSamples ? codeAt(y, first + 1u) : 0u;
+        uint c = first + 2u < rowSamples ? codeAt(y, first + 2u) : 0u;
+        uint d = first + 3u < rowSamples ? codeAt(y, first + 3u) : 0u;
+        dst.words[wordIndex] = a | (b << 8u) | (c << 16u) | (d << 24u);
+        return;
+    }
+    if (p.dimensions.w == 12u) {
+        uint group = wordInRow / 3u * 8u;
+        uint phase = wordInRow % 3u;
+        uint first = group + (phase == 0u ? 0u : phase == 1u ? 2u : 5u);
+        uint a = first < rowSamples ? codeAt(y, first) : 0u;
+        uint b = first + 1u < rowSamples ? codeAt(y, first + 1u) : 0u;
+        uint c = first + 2u < rowSamples ? codeAt(y, first + 2u) : 0u;
+        uint packed;
+        if (phase == 0u) packed = (a << 20u) | (b << 8u) | (c >> 4u);
+        else if (phase == 1u) {
+            uint d = first + 3u < rowSamples ? codeAt(y, first + 3u) : 0u;
+            packed = (a << 28u) | (b << 16u) | (c << 4u) | (d >> 8u);
+        } else packed = (a << 24u) | (b << 12u) | c;
+        dst.words[wordIndex] = swapWordBytes(packed);
         return;
     }
     uint bitStart = wordInRow * 32u;
@@ -128,4 +173,5 @@ void main() {
             packed |= code >> uint(-shift);
     }
     dst.words[wordIndex] = swapWordBytes(packed);
+#endif
 }

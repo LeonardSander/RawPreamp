@@ -11,6 +11,16 @@ float rawpreampGainOrIdentity(float gain) {
     mix(mix((upperLeft), (upperRight), (fraction).x), \
         mix((lowerLeft), (lowerRight), (fraction).x), (fraction).y)
 
+// Coordinates are shared by RGB display and CFA/DNG gain-map sampling.
+void rawpreampGainGrid(uvec2 pixel, uvec2 imageSize, uvec2 gridSize, vec4 axes,
+                      out uvec2 a, out uvec2 b, out vec2 fraction) {
+    vec2 grid = ((vec2(pixel) + vec2(0.5)) / vec2(imageSize) - axes.xy) / axes.zw;
+    vec2 base = floor(grid);
+    fraction = clamp(grid - base, 0.0, 1.0);
+    a = uvec2(clamp(base, vec2(0), vec2(gridSize - uvec2(1))));
+    b = min(a + uvec2(1), gridSize - uvec2(1));
+}
+
 float rawpreampDither(uint x, uint y, uint frameSeed, bool hq) {
     uint rowTerm = y * (hq ? 1013904223u : 0x85ebca77u);
     uint frameTerm = (hq ? 0xdeadbeefu : 0u) ^

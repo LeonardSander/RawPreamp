@@ -67,6 +67,13 @@ bool jpegEncodeTiledVulkanPackedBuffer(
     uint32_t tileWidth, uint32_t tileHeight,
     std::vector<std::vector<uint8_t>>& tiles);
 // `buffer` contains DNG-packed samples in row-aligned 32-bit GPU words.
+// GPU-only packed-buffer encoding; complete JPEG slots and lengths remain
+// resident for decoding or downstream consumers. bits is the packed precision.
+bool jpegEncodeTiledVulkanPackedBufferResident(
+    const void* gpu, const void* buffer, uint32_t width, uint32_t height,
+    uint32_t channels, uint32_t bits, uint32_t wordsPerRow,
+    uint32_t tileWidth, uint32_t tileHeight,
+    const JpegGpuTiledConsumer& consume);
 // The buffer and device must remain valid until consume returns.
 bool jpegEncodeFullyVulkanPackedBufferBorrowed(
     const void *gpu, const void *buffer, uint32_t width, uint32_t height,

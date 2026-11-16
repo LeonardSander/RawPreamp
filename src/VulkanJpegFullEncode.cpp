@@ -5,6 +5,7 @@
 #include "VulkanJpegContext.h"
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -84,9 +85,6 @@ void countResiduals(int v,int a,int b,int c,uint row,uint x) {
         int pred=row==0u&&x==0u?int(1u<<(p.bits-1u)):
                  row==0u?a:x==0u?b:predict(mode,a,b,c);
         int range=65536;
-#ifdef JPEG_TILED_HISTOGRAM
-        range=int(1u<<p.bits);
-#endif
         int d=(v-pred)&(range-1); if(d>=range/2) d-=range;
         uint m=uint(abs(d)); uint cat=m==0u?0u:uint(findMSB(m)+1);
         atomicAdd(localCounts[mode*18u+cat],1u);
@@ -347,7 +345,7 @@ layout(push_constant) uniform Constants {
 void emitByte(uint tile, uint value, inout uint bytePos,
               inout uint word, inout bool good) {
     if (bytePos >= p.strideWords * 4u) { good = false; return; }
-    word |= value << ((bytePos & 3u) * 8u);
+    word |= (value & 255u) << ((bytePos & 3u) * 8u);
     ++bytePos;
     if ((bytePos & 3u) == 0u) {
         bodies.words[tile * p.strideWords + (bytePos >> 2u) - 1u] = word;
@@ -421,6 +419,9 @@ int predictTile(uint mode, int a, int b, int c) {
 }
 vec4 loadPixel(ivec2 pos) {
 #ifdef JPEG_SRC_BUFFER
+    // Edge tiles retain the declared JPEG tile dimensions. Repeat the final
+    // source pixel without accessing beyond the resident packed image.
+    pos = clamp(pos, ivec2(0), ivec2(int(p.width)-1, int(p.height)-1));
     vec4 values = vec4(0.0);
     for (uint c = 0u; c < p.channels; ++c) {
         uint i = uint(pos.x) * p.channels + c;
@@ -451,7 +452,7 @@ vec4 loadPixel(ivec2 pos) {
 void main() {
     uint tile = gl_GlobalInvocationID.x;
     if (tile >= p.tiles) return;
-    uint across = p.width / p.tileWidth;
+    uint across = (p.width + p.tileWidth - 1u) / p.tileWidth;
     uint ox = (tile % across) * p.tileWidth;
     uint oy = (tile / across) * p.tileHeight;
     uint bytePos = 0u, word = 0u, reservoir = 0u, pending = 0u;
@@ -479,7 +480,9 @@ void main() {
                 int pred = y == 0u && x == 0u ? int(1u << (p.sourceBits - 1u)) :
                            y == 0u ? left : x == 0u ? above :
                            predictTile(mode, left, above, diagonal);
-                int range = int(1u << p.sourceBits);
+                // Match the lossless decoder's 16-bit reconstruction arithmetic,
+                // also for packed sources with fewer than sixteen stored bits.
+                int range = 65536;
                 int diff = (sampleValue - pred) & (range - 1);
                 if (diff >= range / 2) diff -= range;
                 uint mag = uint(abs(diff));
@@ -649,11 +652,12 @@ void main() {
     }
     emit(start, table.values[0], cursor, word);
     emit(start, 0u, cursor, word); emit(start, 0u, cursor, word);
-    for (uint i = 0u; cursor < (firstBodyWord << 2u); ++i) {
+    uint leadingBytes = min(bodyLength, (4u - (headerBytes & 3u)) & 3u);
+    for (uint i = 0u; i < leadingBytes; ++i) {
         uint value = bodies.words[bodyBase + (i >> 2u)] >> ((i & 3u) * 8u);
         emit(start, value, cursor, word);
     }
-    cursor = lastBodyWord << 2u;
+    cursor = max(cursor, lastBodyWord << 2u);
     for (uint i = cursor - headerBytes; i < bodyLength; ++i) {
         uint value = bodies.words[bodyBase + (i >> 2u)] >> ((i & 3u) * 8u);
         emit(start, value, cursor, word);
@@ -915,7 +919,7 @@ struct State {
   pl_pass p[PassCount]{};
   pl_pass tiledTexturePass = nullptr;
   pl_pass tiledDirectPass = nullptr;
-  pl_pass tiledBufferPass = nullptr;
+  pl_pass tiledBufferPass = nullptr, tiledBufferDirectPass = nullptr;
   pl_pass tiledHistogramBufferPass = nullptr;
   pl_pass tiledPrefixPass = nullptr, tiledCompactPass = nullptr;
   pl_pass tiledJpegPrefixPass = nullptr, tiledJpegAssemblePass = nullptr;
@@ -942,6 +946,7 @@ struct State {
     pl_pass_destroy(gpu, &tiledTexturePass);
     pl_pass_destroy(gpu, &tiledDirectPass);
     pl_pass_destroy(gpu, &tiledBufferPass);
+    pl_pass_destroy(gpu, &tiledBufferDirectPass);
     pl_pass_destroy(gpu, &tiledHistogramBufferPass);
     pl_pass_destroy(gpu, &tiledPrefixPass);
     pl_pass_destroy(gpu, &tiledCompactPass);
@@ -952,46 +957,52 @@ struct State {
                    &tiledTableReadback, &tiledCompact, &tiledOffsets})
       pl_buf_destroy(gpu, x);
   }
-  bool init(pl_gpu sharedGpu) {
-    if (p[0])
-      return std::all_of(std::begin(p), std::begin(p) + StuffPass + 1,
-                         [](pl_pass pass) { return pass != nullptr; });
+  bool initTable(pl_gpu sharedGpu) {
+    if (gpu && gpu != sharedGpu) return false;
     gpu = sharedGpu;
-    p[HistogramPass] =
-        makePass(gpu, histogramShader,
-                 {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
-                  {"hist", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READWRITE}},
-                 6);
-    p[TablePass] = makePass(
+    if (!p[TablePass]) p[TablePass] = makePass(
         gpu, tableShader,
         {{"hist", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
          {"outTable", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY}},
         1);
-    p[PackPass] = makePass(
+    return p[TablePass] != nullptr;
+  }
+  bool init(pl_gpu sharedGpu) {
+    if (gpu && gpu != sharedGpu) return false;
+    if (std::all_of(std::begin(p), std::begin(p) + StuffPass + 1,
+                    [](pl_pass pass) { return pass != nullptr; })) return true;
+    gpu = sharedGpu;
+    if (!p[HistogramPass]) p[HistogramPass] =
+        makePass(gpu, histogramShader,
+                 {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
+                  {"hist", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READWRITE}},
+                 6);
+    if (!initTable(sharedGpu)) return false;
+    if (!p[PackPass]) p[PackPass] = makePass(
         gpu, packShader,
         {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
          {"table", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
          {"packed", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
          {"lengths", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_WRITEONLY}},
         8);
-    p[ScanPass] =
+    if (!p[ScanPass]) p[ScanPass] =
         makePass(gpu, scanShader,
                  {{"lengths", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
                   {"offsets", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
                   {"sums", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY}},
                  2);
-    p[TotalPass] =
+    if (!p[TotalPass]) p[TotalPass] =
         makePass(gpu, totalShader,
                  {{"sums", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
                   {"offsets", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
                   {"total", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY}},
                  1);
-    p[ClearPass] = makePass(
+    if (!p[ClearPass]) p[ClearPass] = makePass(
         gpu, clearShader,
         {{"joined", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_WRITEONLY},
          {"outputData", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY}},
         2);
-    p[JoinPass] =
+    if (!p[JoinPass]) p[JoinPass] =
         makePass(gpu, joinShader,
                  {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
                   {"lengths", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
@@ -999,14 +1010,14 @@ struct State {
                   {"groups", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY},
                   {"dst", PL_DESC_BUF_STORAGE, 4, PL_DESC_ACCESS_READWRITE}},
                  3);
-    p[StuffCountPass] =
+    if (!p[StuffCountPass]) p[StuffCountPass] =
         makePass(gpu, stuffCountShader,
                  {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
                   {"total", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
                   {"offsets", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
                   {"sums", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_WRITEONLY}},
                  2);
-    p[StuffTotalPass] = makePass(
+    if (!p[StuffTotalPass]) p[StuffTotalPass] = makePass(
         gpu, stuffTotalShader,
         {{"sums", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
          {"offsets", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
@@ -1014,7 +1025,7 @@ struct State {
          {"table", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY},
          {"outputData", PL_DESC_BUF_STORAGE, 4, PL_DESC_ACCESS_READWRITE}},
         8);
-    p[StuffPass] =
+    if (!p[StuffPass]) p[StuffPass] =
         makePass(gpu, stuffShader,
                  {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
                   {"total", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
@@ -1027,8 +1038,8 @@ struct State {
         return false;
     return true;
   }
-  bool initTexture(pl_gpu sharedGpu, bool rgb) {
-    if (!init(sharedGpu))
+  bool initTexture(pl_gpu sharedGpu, bool rgb, bool fullFrame = true) {
+    if (!(fullFrame ? init(sharedGpu) : initTable(sharedGpu)))
       return false;
     const Pass histogramPass = rgb ? HistogramRgbTexturePass : HistogramTexturePass;
     const Pass packPass = rgb ? PackRgbTexturePass : PackTexturePass;
@@ -1040,7 +1051,7 @@ struct State {
            {"hist", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READWRITE}},
           6);
     }
-    if (!p[packPass]) {
+    if (fullFrame && !p[packPass]) {
       const auto shader = textureShader(packShader, rgb);
       p[packPass] = makePass(
           gpu, shader.c_str(),
@@ -1050,62 +1061,59 @@ struct State {
            {"lengths", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_WRITEONLY}},
           8);
     }
-    return p[histogramPass] && p[packPass];
+    return p[histogramPass] && (!fullFrame || p[packPass]);
   }
-  bool initTiledTexture(pl_gpu sharedGpu) {
-    if (tiledTexturePass)
-      return gpu == sharedGpu && tiledDirectPass && tiledPrefixPass && tiledCompactPass &&
-             tiledJpegPrefixPass && tiledJpegAssemblePass;
-    if (gpu && gpu != sharedGpu) return false;
-    gpu = sharedGpu;
-    tiledTexturePass = makePass(
-        gpu, tiledTextureShader,
-        {{"srcTex", PL_DESC_SAMPLED_TEX, 0, PL_DESC_ACCESS_READONLY},
-         {"bodies", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
-         {"lengths", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
-         {"table", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY}}, 9);
-    std::string residentShader = tiledTextureShader;
-    residentShader.insert(residentShader.find('\n') + 1u,
-                          "#define JPEG_DIRECT_SLOT\n");
-    tiledDirectPass = makePass(
-        gpu, residentShader.c_str(),
-        {{"srcTex", PL_DESC_SAMPLED_TEX, 0, PL_DESC_ACCESS_READONLY},
-         {"bodies", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
-         {"lengths", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
-         {"table", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY}}, 9);
-    tiledPrefixPass = makePass(
-        gpu, tiledPrefixShader,
-        {{"lengths", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
-         {"offsets", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY}}, 1);
-    tiledCompactPass = makePass(
-        gpu, tiledCompactShader,
-        {{"bodies", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
-         {"lengths", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
-         {"offsets", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_READONLY},
-         {"compact", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_WRITEONLY}}, 3);
-    tiledJpegPrefixPass = makePass(
-        gpu, tiledJpegPrefixShader,
-        {{"lengths", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
-         {"table", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
-         {"offsets", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY}}, 2);
-    tiledJpegAssemblePass = makePass(
+  bool initTiledTexture(pl_gpu sharedGpu, bool direct) {
+    if (!initTable(sharedGpu)) return false;
+    auto& pass = direct ? tiledDirectPass : tiledTexturePass;
+    if (!pass) {
+      std::string shader = tiledTextureShader;
+      if (direct) shader.insert(shader.find('\n') + 1u, "#define JPEG_DIRECT_SLOT\n");
+      pass = makePass(gpu, shader.c_str(),
+          {{"srcTex", PL_DESC_SAMPLED_TEX, 0, PL_DESC_ACCESS_READONLY},
+           {"bodies", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
+           {"lengths", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
+           {"table", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY}}, 9);
+    }
+    return pass != nullptr;
+  }
+  bool initTiledCompact() {
+    if (!tiledPrefixPass) tiledPrefixPass = makePass(
+          gpu, tiledPrefixShader,
+          {{"lengths", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
+           {"offsets", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY}}, 1);
+    if (!tiledCompactPass) tiledCompactPass = makePass(
+          gpu, tiledCompactShader,
+          {{"bodies", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
+           {"lengths", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
+           {"offsets", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_READONLY},
+           {"compact", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_WRITEONLY}}, 3);
+    return tiledPrefixPass && tiledCompactPass;
+  }
+  bool initTiledAssembly() {
+    if (!tiledJpegPrefixPass) tiledJpegPrefixPass = makePass(
+          gpu, tiledJpegPrefixShader,
+          {{"lengths", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
+           {"table", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
+           {"offsets", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY}}, 2);
+
+    if (!tiledJpegAssemblePass) tiledJpegAssemblePass = makePass(
         gpu, tiledJpegAssembleShader,
         {{"bodies", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
          {"lengths", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
          {"offsets", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_READONLY},
          {"table", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY},
          {"outputData", PL_DESC_BUF_STORAGE, 4, PL_DESC_ACCESS_WRITEONLY}}, 8);
-    return tiledTexturePass && tiledDirectPass && tiledPrefixPass && tiledCompactPass &&
-           tiledJpegPrefixPass && tiledJpegAssemblePass;
+    return tiledJpegPrefixPass && tiledJpegAssemblePass;
   }
-  bool initTiledBuffer(pl_gpu sharedGpu) {
-    if (!initTiledTexture(sharedGpu) || !init(sharedGpu)) return false;
-    if (tiledBufferPass && tiledHistogramBufferPass) return true;
-    if (!tiledBufferPass) {
+  bool initTiledBuffer(pl_gpu sharedGpu, bool direct) {
+    if (!initTable(sharedGpu)) return false;
+    auto& pass = direct ? tiledBufferDirectPass : tiledBufferPass;
+    if (!pass) {
       std::string shader = tiledTextureShader;
       shader.insert(shader.find('\n') + 1u, "#define JPEG_SRC_BUFFER\n");
-      tiledBufferPass = makePass(
-          gpu, shader.c_str(),
+      if (direct) shader.insert(shader.find('\n') + 1u, "#define JPEG_DIRECT_SLOT\n");
+      pass = makePass(gpu, shader.c_str(),
           {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
            {"bodies", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_WRITEONLY},
            {"lengths", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
@@ -1120,10 +1128,21 @@ struct State {
           {{"src", PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
            {"hist", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READWRITE}}, 6);
     }
-    return tiledBufferPass && tiledHistogramBufferPass;
+    return pass && tiledHistogramBufferPass;
+  }
+  bool histogramZeroReady = false;
+  void clearHistogram() {
+    if (!histogramZeroReady) {
+      const std::array<uint32_t, 8u * 18u> zeros{};
+      pl_buf_write(gpu, b[HistogramZero], 0, zeros.data(), sizeof(zeros));
+      histogramZeroReady = true;
+    }
+    pl_buf_copy(gpu, b[Histogram], 0, b[HistogramZero], 0, 8u * 18u * 4u);
   }
   bool buffer(Buffer index, size_t bytes, bool hostReadable = false,
               bool hostWritable = false, bool hostMapped = false) {
+    if (index == HistogramZero && (!b[index] || b[index]->params.size != bytes))
+      histogramZeroReady = false;
     pl_buf_params params{};
     params.size = bytes;
     params.storable = !hostReadable && !hostWritable;
@@ -1137,7 +1156,8 @@ struct State {
   }
   void run(Pass pass, std::initializer_list<Buffer> objects, void *constants,
            int groups) {
-    std::vector<pl_desc_binding> bindings(objects.size());
+    std::array<pl_desc_binding, 5> bindings{};
+    assert(objects.size() <= bindings.size());
     int i = 0;
     for (auto object : objects)
       bindings[i++].object = b[object];
@@ -1152,7 +1172,8 @@ struct State {
   void runTexture(Pass pass, pl_tex texture,
                   std::initializer_list<Buffer> objects, void *constants,
                   int groups) {
-    std::vector<pl_desc_binding> bindings(objects.size() + 1u);
+    std::array<pl_desc_binding, 5> bindings{};
+    assert(objects.size() + 1u <= bindings.size());
     bindings[0].object = texture;
     int i = 1;
     for (auto object : objects)
@@ -1327,9 +1348,7 @@ bool encodeOnGpu(pl_gpu gpu, State &s, const uint16_t *pixels, pl_tex texture,
     }
     pl_buf_copy(gpu, s.b[Src], 0, s.b[Upload], 0, sourceBytes);
   }
-  std::array<uint32_t, 8u * 18u> emptyHistogram{};
-  pl_buf_write(gpu, s.b[HistogramZero], 0, emptyHistogram.data(), histBytes);
-  pl_buf_copy(gpu, s.b[Histogram], 0, s.b[HistogramZero], 0, histBytes);
+  s.clearHistogram();
   markStage("upload");
   uint32_t dimensions[6] = {width, height, channels, bits,
                             sourcePrecision,
@@ -1567,7 +1586,8 @@ static bool encodeTiledVulkanTexture(
       static_cast<pl_buf>(const_cast<void *>(sourceHandle)) : nullptr;
   if (!gpu || (!texture && !inputBuffer) ||
       (channels != 1u && channels != 3u) || !tileWidth || !tileHeight ||
-      width % tileWidth || height % tileHeight ||
+      !width || !height ||
+      (!packedBuffer && (width % tileWidth || height % tileHeight)) ||
       tileWidth > 65535u || tileHeight > 65535u ||
       uint64_t(tileWidth) * tileHeight * channels > 65536u ||
       sourceBits < 8u || sourceBits > 16u ||
@@ -1593,8 +1613,8 @@ static bool encodeTiledVulkanTexture(
       if (format->host_bits[c] != 16 || format->sample_order[c] != int(c))
         return false;
   }
-  const uint64_t tileCount64 = uint64_t(width / tileWidth) *
-                               (height / tileHeight);
+  const uint64_t tileCount64 = ((uint64_t(width) + tileWidth - 1u) / tileWidth) *
+                               ((uint64_t(height) + tileHeight - 1u) / tileHeight);
   if (uint64_t(width) * height * channels > UINT32_MAX) return false;
   const uint64_t tileSamples = uint64_t(tileWidth) * tileHeight * channels;
   const uint64_t strideWords64 = (tileSamples * 3u + 3u) / 4u;
@@ -1629,18 +1649,25 @@ static bool encodeTiledVulkanTexture(
 #else
   const auto stage = [](const char*) {};
 #endif
-  if (!(packedBuffer ? s.initTiledBuffer(gpu) :
-        s.initTiledTexture(gpu) && s.initTexture(gpu, channels == 3u))) {
+  const bool directResident = residentConsumer &&
+      rawpreamp::debugEnvironment("RAWPREAMP_GPU_TILED_JPEG_DIRECT_DISABLE") == nullptr;
+  if (!(packedBuffer ? s.initTiledBuffer(gpu, directResident) :
+        s.initTiledTexture(gpu, directResident) && s.initTexture(gpu, channels == 3u, false))) {
     std::fprintf(stderr, "GPU tiled JPEG: shader initialization failed\n");
     return false;
   }
   const size_t bodyBytes = size_t(bodyWords64) * 4u;
   const size_t lengthBytes = size_t(tileCount64) * 4u;
   const bool compact = channels == 3u;
-  const bool gpuAssemble = residentConsumer ||
+  bool gpuAssemble = residentConsumer ||
       rawpreamp::debugEnvironment("RAWPREAMP_GPU_TILED_JPEG_GPU_ASSEMBLE_DISABLE") == nullptr;
-  const bool directResident = residentConsumer &&
-      rawpreamp::debugEnvironment("RAWPREAMP_GPU_TILED_JPEG_DIRECT_DISABLE") == nullptr;
+  if (!directResident && gpuAssemble && !s.initTiledAssembly()) {
+    if (residentConsumer) return false;
+    // Preserve GPU entropy encoding when assembly is unavailable. Only the
+    // compressed payload is read back for CPU JPEG header assembly.
+    gpuAssemble = false;
+  }
+  if (!directResident && !gpuAssemble && compact && !s.initTiledCompact()) return false;
   const bool sameLayout = s.lastTiledWidth == width &&
       s.lastTiledHeight == height && s.lastTiledChannels == channels &&
       s.lastTiledBits == sourceBits &&
@@ -1684,11 +1711,7 @@ static bool encodeTiledVulkanTexture(
                  bodyBytes, size_t(gpu->limits.max_ssbo_size));
     return false;
   }
-  std::array<uint32_t, 8u * 18u> emptyHistogram{};
-  pl_buf_write(gpu, s.b[HistogramZero], 0, emptyHistogram.data(),
-               emptyHistogram.size() * 4u);
-  pl_buf_copy(gpu, s.b[Histogram], 0, s.b[HistogramZero], 0,
-              emptyHistogram.size() * 4u);
+  s.clearHistogram();
   uint32_t dimensions[6] = {width, height, channels, sourceBits, sourceBits,
                             packedBuffer ? sourceWordsPerRow : 0u};
   const uint32_t samples = width * height * channels;
@@ -1710,7 +1733,9 @@ static bool encodeTiledVulkanTexture(
                                 : HistogramTexturePass,
                  texture, {Histogram}, dimensions,
                  int((histInvocations + 255u) / 256u));
-  uint32_t sampleCount = samples;
+  // Tile restarts and edge padding can introduce residual categories absent
+  // from the full-image histogram. Keep a code for every possible category.
+  uint32_t sampleCount = std::max(samples, 1000000u);
   s.run(TablePass, {Histogram, Table}, &sampleCount, 1);
   stage("histogram_table");
   uint32_t constants[9] = {
@@ -1724,7 +1749,7 @@ static bool encodeTiledVulkanTexture(
   bindings[2].object = s.tiledLengths;
   bindings[3].object = s.b[Table];
   pl_pass_run_params run{};
-  run.pass = packedBuffer ? s.tiledBufferPass :
+  run.pass = packedBuffer ? (directResident ? s.tiledBufferDirectPass : s.tiledBufferPass) :
              directResident ? s.tiledDirectPass : s.tiledTexturePass;
   run.desc_bindings = bindings;
   run.push_constants = constants;
@@ -1829,13 +1854,29 @@ static bool encodeTiledVulkanTexture(
       s.tiledTableReadback->data);
   if (tableWords[1] == 0u || tableWords[1] > 17u ||
       tableWords[0] < 1u || tableWords[0] > 7u) return false;
-  size_t compactUsed = 0;
+  // GPU assembly needs header length only; construct bytes only for CPU output.
+  const size_t headerBytes = 41u + tableWords[1] + 5u * channels;
+  size_t compactUsed = 0, totalJpegBytes = 0, paddedBytes = 0;
+  VulkanJpegTiledPayload result;
+  result.offsets.resize(size_t(tileCount64));
+  result.lengths.resize(size_t(tileCount64));
   for (size_t tile = 0; tile < size_t(tileCount64); ++tile) {
     if (!lengths[tile] || lengths[tile] > strideWords64 * 4u ||
         compactUsed > bodyBytes -
             std::min(bodyBytes, size_t((lengths[tile] + 3u) & ~3u)))
       return false;
     compactUsed += (size_t(lengths[tile]) + 3u) & ~size_t{3};
+    const size_t jpegBytes = headerBytes + lengths[tile] + 2u;
+    if (jpegBytes > UINT32_MAX || totalJpegBytes > UINT32_MAX - jpegBytes) return false;
+    result.offsets[tile] = uint32_t(gpuAssemble ? paddedBytes : totalJpegBytes);
+    result.lengths[tile] = uint32_t(jpegBytes);
+    totalJpegBytes += jpegBytes;
+    if (gpuAssemble) {
+      const size_t padded = (jpegBytes + 3u) & ~size_t{3};
+      if (paddedBytes > outputBytes || padded > outputBytes - paddedBytes ||
+          paddedBytes > UINT32_MAX || padded > UINT32_MAX - paddedBytes) return false;
+      paddedBytes += padded;
+    }
   }
   if (compactUsed > bodyBytes || (!gpuAssemble && compact && compactUsed > compactBytes))
     return false;
@@ -1844,70 +1885,46 @@ static bool encodeTiledVulkanTexture(
     out.push_back(uint8_t(value));
   };
   std::vector<uint8_t> header;
-  header.reserve(96u);
-  header.insert(header.end(), {0xff, 0xd8, 0xff, 0xc4});
-  emit16(header, 19u + tableWords[1]);
-  header.push_back(0u);
-  for (uint32_t len = 0; len < 16; ++len)
-    header.push_back(uint8_t(tableWords[2u + len]));
-  for (uint32_t index = 0; index < tableWords[1]; ++index)
-    header.push_back(uint8_t(tableWords[18u + index]));
-  header.insert(header.end(), {0xff, 0xc3});
-  emit16(header, 8u + 3u * channels);
-  header.push_back(uint8_t(sourceBits));
-  emit16(header, tileHeight);
-  emit16(header, tileWidth);
-  header.push_back(uint8_t(channels));
-  for (uint32_t c = 0; c < channels; ++c) {
-    header.push_back(uint8_t(c));
-    header.push_back(0x11u);
+  if (!gpuAssemble) {
+    header.reserve(96u);
+    header.insert(header.end(), {0xff, 0xd8, 0xff, 0xc4});
+    emit16(header, 19u + tableWords[1]);
     header.push_back(0u);
-  }
-  header.insert(header.end(), {0xff, 0xda});
-  emit16(header, 6u + 2u * channels);
-  header.push_back(uint8_t(channels));
-  for (uint32_t c = 0; c < channels; ++c) {
-    header.push_back(uint8_t(c));
-    header.push_back(0u);
-  }
-  header.push_back(uint8_t(tableWords[0]));
-  header.push_back(0u);
-  header.push_back(0u);
-  size_t totalJpegBytes = 0;
-  for (size_t tile = 0; tile < size_t(tileCount64); ++tile) {
-    if (totalJpegBytes > UINT32_MAX - header.size() -
-            size_t(lengths[tile]) - 2u) return false;
-    totalJpegBytes += header.size() + lengths[tile] + 2u;
-  }
-  VulkanJpegTiledPayload result;
-  result.offsets.resize(size_t(tileCount64));
-  result.lengths.resize(size_t(tileCount64));
-  if (gpuAssemble) {
-    size_t paddedBytes = 0;
-    for (size_t tile = 0; tile < size_t(tileCount64); ++tile) {
-      const size_t jpegBytes = header.size() + lengths[tile] + 2u;
-      if (paddedBytes > outputBytes ||
-          ((jpegBytes + 3u) & ~size_t{3}) > outputBytes - paddedBytes)
-        return false;
-      result.offsets[tile] = uint32_t(paddedBytes);
-      result.lengths[tile] = uint32_t(jpegBytes);
-      paddedBytes += (jpegBytes + 3u) & ~size_t{3};
+    for (uint32_t len = 0; len < 16; ++len)
+      header.push_back(uint8_t(tableWords[2u + len]));
+    for (uint32_t index = 0; index < tableWords[1]; ++index)
+      header.push_back(uint8_t(tableWords[18u + index]));
+    header.insert(header.end(), {0xff, 0xc3});
+    emit16(header, 8u + 3u * channels);
+    header.push_back(uint8_t(sourceBits));
+    emit16(header, tileHeight);
+    emit16(header, tileWidth);
+    header.push_back(uint8_t(channels));
+    for (uint32_t c = 0; c < channels; ++c) {
+      header.push_back(uint8_t(c));
+      header.push_back(0x11u);
+      header.push_back(0u);
     }
+    header.insert(header.end(), {0xff, 0xda});
+    emit16(header, 6u + 2u * channels);
+    header.push_back(uint8_t(channels));
+    for (uint32_t c = 0; c < channels; ++c) {
+      header.push_back(uint8_t(c));
+      header.push_back(0u);
+    }
+    header.push_back(uint8_t(tableWords[0]));
+    header.push_back(0u);
+    header.push_back(0u);
+  }
+  if (gpuAssemble) {
     result.bytes.assign(body, body + paddedBytes);
     s.lastTiledOutputBytes = paddedBytes;
   } else {
     result.bytes.resize(totalJpegBytes);
-    size_t compactOffset = 0, jpegOffset = 0;
+    size_t compactOffset = 0;
     for (size_t tile = 0; tile < size_t(tileCount64); ++tile) {
-      if (!lengths[tile] || lengths[tile] > strideWords64 * 4u) {
-        std::fprintf(stderr, "GPU tiled JPEG: tile %zu length=%u capacity=%zu\n",
-                     tile, lengths[tile], size_t(strideWords64) * 4u);
-        return false;
-      }
-      const size_t jpegBytes = header.size() + lengths[tile] + 2u;
-      result.offsets[tile] = uint32_t(jpegOffset);
-      result.lengths[tile] = uint32_t(jpegBytes);
-      auto* jpeg = result.bytes.data() + jpegOffset;
+      const size_t jpegBytes = result.lengths[tile];
+      auto* jpeg = result.bytes.data() + result.offsets[tile];
       std::memcpy(jpeg, header.data(), header.size());
       const size_t bodyOffset = compact
           ? compactOffset : tile * size_t(strideWords64) * 4u;
@@ -1915,7 +1932,6 @@ static bool encodeTiledVulkanTexture(
       compactOffset += (size_t(lengths[tile]) + 3u) & ~size_t{3};
       jpeg[jpegBytes - 2u] = 0xff;
       jpeg[jpegBytes - 1u] = 0xd9;
-      jpegOffset += jpegBytes;
     }
   }
   s.lastTiledBodyBytes = compactUsed;
@@ -1961,6 +1977,14 @@ bool jpegEncodeTiledVulkanPackedBuffer(
   return encodeTiledVulkanTexture(gpu, buffer, width, height, channels,
                                  tileWidth, tileHeight, &tiles, nullptr,
                                  nullptr, true, wordsPerRow, bits);
+}
+
+bool jpegEncodeTiledVulkanPackedBufferResident(
+    const void* gpu, const void* buffer, uint32_t width, uint32_t height,
+    uint32_t channels, uint32_t bits, uint32_t wordsPerRow,
+    uint32_t tileWidth, uint32_t tileHeight, const JpegGpuTiledConsumer& consume) {
+  return consume && encodeTiledVulkanTexture(gpu, buffer, width, height, channels,
+      tileWidth, tileHeight, nullptr, nullptr, &consume, true, wordsPerRow, bits);
 }
 
 bool jpegEncodeTiledVulkanTextureResident(
@@ -2064,6 +2088,9 @@ bool jpegEncodeTiledVulkanPackedBuffer(
     uint32_t, uint32_t, uint32_t, std::vector<std::vector<uint8_t>>&) {
   return false;
 }
+bool jpegEncodeTiledVulkanPackedBufferResident(
+    const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, const JpegGpuTiledConsumer&) { return false; }
 bool jpegEncodeTiledVulkanTextureResident(
     const void *, const void *, uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, const JpegGpuTiledConsumer&) {

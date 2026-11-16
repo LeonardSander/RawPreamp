@@ -14,6 +14,7 @@
 
 namespace rawpreamp {
 struct VulkanGainBakeTextureSource;
+struct VulkanGainBakeBufferSource;
 
 namespace utils { struct ActiveBadPixel; }
 
@@ -189,7 +190,8 @@ public:
                                    bool highQuality, uint32_t ditherSeed,
                                    std::vector<uint8_t>* gpuJpeg = nullptr,
                                    std::vector<std::vector<uint8_t>>* gpuJpegTiles = nullptr,
-                                   LogCurve curve = LogCurve::LOG60);
+                                   LogCurve curve = LogCurve::LOG60,
+                                   const VulkanGainBakeBufferSource* bufferSource = nullptr);
     static bool decodePreview(std::vector<uint8_t> dngData,
                               const RenderSettings& settings,
                               PreviewFrame& frame,
@@ -247,7 +249,8 @@ public:
                              const VulkanGainBakeTextureSource* textureSource = nullptr,
                              std::vector<uint8_t>* gpuJpeg = nullptr,
                              std::vector<std::vector<uint8_t>>* gpuJpegTiles = nullptr,
-                             LogCurve curve = LogCurve::LOG60);
+                             LogCurve curve = LogCurve::LOG60,
+                             const VulkanGainBakeBufferSource* bufferSource = nullptr);
     static bool transformGainMaps(std::vector<uint8_t>& dngData,
                                   bool normalizeGainMaps,
                                   bool colorOnly,

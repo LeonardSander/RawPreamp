@@ -274,6 +274,46 @@ void processDngPixels(std::vector<uint8_t>& dng,
          (remosaic && !options.textureSource) ||
          (!options.hasCfa && remosaic) ||
          (debugGainMap && options.hasCfa && demosaics(mode) && !remosaic));
+    if (options.bufferSource) {
+        // Resident raw input is admitted only with unchanged CFA topology. All
+        // pixel work, packing and optional JPEG encoding happens on its GPU.
+        if (scale != 1 || !options.hasCfa || options.cfaRepeatSize != 2 ||
+            remosaic || settings.cameraNativeStaging ||
+            (settings.options & (RENDER_OPT_CROPPING | RENDER_OPT_BAKE_ISO)))
+            throw std::runtime_error("Unsupported resident raw topology");
+        const bool normalize = settings.options & RENDER_OPT_NORMALIZE_SHADING_MAP;
+        const bool optimize = settings.options & RENDER_OPT_OPTIMIZE_GAIN_MAPS;
+        if (!bakeGain && (hasOpcode2 || hasOpcode3Luma) &&
+            (normalize || colorOnly || optimize) &&
+            !DNGDecoder::transformGainMaps(dng, normalize, colorOnly, optimize))
+            throw std::runtime_error("Unsupported resident gain-map metadata");
+        const auto log = (settings.options & RENDER_OPT_LOG_TRANSFORM) && !debugGainMap
+            ? settings.logTransform : LogTransformMode::Disabled;
+        bool fused = false;
+        const bool processed = bakeGain
+            ? DNGDecoder::bakeGainMaps(dng, normalize, colorOnly, optimize,
+                debugGainMap, 2, options.cfaPhase, log,
+                options.inputQuantizationWhite, settings.options & RENDER_OPT_LOG_HQ,
+                &fused, true, options.ditherSeed, true, nullptr,
+                options.gpuJpeg, options.gpuJpegTiles ? &options.gpuJpegTiles->bytes : nullptr,
+                LogCurve::LOG60, options.bufferSource)
+            : DNGDecoder::bakeLogStripVulkan(dng, log,
+                options.inputQuantizationWhite, settings.options & RENDER_OPT_LOG_HQ,
+                options.ditherSeed, options.gpuJpeg,
+                options.gpuJpegTiles ? &options.gpuJpegTiles->bytes : nullptr,
+                LogCurve::LOG60, options.bufferSource);
+        if (!processed)
+            throw std::runtime_error("Resident raw processing failed");
+        if (bakeGain && fused && !DNGDecoder::applyLogTransform(dng, log,
+                options.inputQuantizationWhite, settings.options & RENDER_OPT_LOG_HQ, true))
+            throw std::runtime_error("Could not update resident raw LOG metadata");
+        if (options.gpuJpegTiles && !options.gpuJpegTiles->bytes.empty()) {
+            const auto shape = jpeg92TileShape(1);
+            options.gpuJpegTiles->width = shape.width;
+            options.gpuJpegTiles->height = shape.height;
+        }
+        return;
+    }
     const auto texturePreparationStarted = rawpreamp::diagnosticNow();
     const VulkanGainBakeTextureSource* textureSource = options.textureSource;
     // A Native Video texture with no remaining pixel operation can go straight

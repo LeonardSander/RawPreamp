@@ -145,6 +145,30 @@ inline std::vector<uint16_t> makeLog60LinearizationTable(
     return table;
 }
 
+// Immutable per-worker inverse transfer table. Like the encode cache, the
+// reference remains valid until this thread requests a different key.
+inline const std::vector<uint16_t>& cachedLog60LinearizationTable(
+        uint32_t storedWhiteLevel, LogCurve curve = LogCurve::LOG60) {
+    // LOG-disabled callers must not evict the table needed later in the same
+    // frame's processing pipeline.
+    if (!storedWhiteLevel || storedWhiteLevel > 65535u) {
+        static const std::vector<uint16_t> empty;
+        return empty;
+    }
+    struct Cache {
+        uint32_t white = std::numeric_limits<uint32_t>::max();
+        LogCurve curve = LogCurve::LOG60;
+        std::vector<uint16_t> table;
+    };
+    static thread_local Cache cache;
+    if (cache.white != storedWhiteLevel || cache.curve != curve) {
+        cache.table = makeLog60LinearizationTable(storedWhiteLevel, curve);
+        cache.white = storedWhiteLevel;
+        cache.curve = curve;
+    }
+    return cache.table;
+}
+
 inline void applyLinearizationTable(uint16_t* samples, size_t count,
                                     const std::vector<uint16_t>& table) {
     if (!samples || table.empty()) return;

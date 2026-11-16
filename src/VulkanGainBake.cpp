@@ -1,3 +1,5 @@
+#include "VulkanSpatialGainCache.h"
+#include "VulkanUploadCache.h"
 #include "DebugInstrumentation.h"
 #include "VulkanGainBake.h"
 
@@ -49,6 +51,7 @@ struct alignas(16) Constants {
     uint32_t encodedWhite, ditherSeed, flags, rowBytes, wordsPerRow;
 };
 struct Device {
+    std::shared_ptr<void> sourceDeviceLease;
     pl_log log = nullptr;
     pl_vulkan vk = nullptr;
     pl_gpu gpu = nullptr;
@@ -59,20 +62,27 @@ struct Device {
     bool mappedReadbackUnavailable = false;
     pl_pass pass = nullptr, cfaPass = nullptr;
     pl_pass multiPass = nullptr, multiCfaPass = nullptr;
+    VulkanSpatialGainCache spatialGains;
+    std::array<pl_pass,4> spatialBuild{}, spatialUse{};
     pl_timer passTimer = nullptr;
     pl_buf source = nullptr, map = nullptr, output = nullptr, linearization = nullptr;
     pl_buf directOutput = nullptr;
     pl_buf sourceStage = nullptr, mapStage = nullptr, outputStage = nullptr;
+    pl_buf validationStage = nullptr;
     pl_buf outputStageSecond = nullptr;
     pl_buf linearizationStage = nullptr;
     ~Device() {
         if (gpu) {
             pl_gpu_finish(gpu);
+            spatialGains.reset();
+            for (auto& pass : spatialBuild) pl_pass_destroy(gpu, &pass);
+            for (auto& pass : spatialUse) pl_pass_destroy(gpu, &pass);
             pl_buf_destroy(gpu, &source);
             pl_buf_destroy(gpu, &map);
             pl_buf_destroy(gpu, &output);
             pl_buf_destroy(gpu, &directOutput);
             pl_buf_destroy(gpu, &linearization);
+            pl_buf_destroy(gpu, &validationStage);
             pl_buf_destroy(gpu, &sourceStage);
             pl_buf_destroy(gpu, &mapStage);
             pl_buf_destroy(gpu, &outputStage);
@@ -182,8 +192,34 @@ struct Device {
         selected = pl_pass_create(gpu, &pp);
         return selected != nullptr;
     }
+    pl_pass spatialPass(bool cfa, bool multi, bool build) {
+        auto& pass = (build ? spatialBuild : spatialUse)[(cfa ? 2u : 0u) + (multi ? 1u : 0u)];
+        if (pass) return pass;
+        pl_desc descriptors[] = {
+            {textureSource ? "sourceImage" : "src", textureSource ? PL_DESC_SAMPLED_TEX : PL_DESC_BUF_STORAGE, 0, PL_DESC_ACCESS_READONLY},
+            {cfa || multi ? "gainMaps" : "gainMap", PL_DESC_BUF_STORAGE, 1, PL_DESC_ACCESS_READONLY},
+            {"dst", PL_DESC_BUF_STORAGE, 2, PL_DESC_ACCESS_WRITEONLY},
+            {"linearization", PL_DESC_BUF_STORAGE, 3, PL_DESC_ACCESS_READONLY},
+            {"spatialGain", PL_DESC_BUF_STORAGE, 4, PL_DESC_ACCESS_READONLY}};
+        const char* original = cfa ? vulkanCfaGainBakeShader : vulkanGainBakeShader;
+        std::string shader(original);
+        shader.insert(shader.find('\n') + 1,
+            std::string(textureSource ? "#define SOURCE_TEXTURE 1\n" : "") +
+            (multi ? "#define MULTI_MAP 1\n" : "") +
+            (build ? "#define SPATIAL_GAIN_BUILD 1\n" : "#define SPATIAL_GAIN_USE 1\n"));
+        pl_pass_params params{};
+        params.type = PL_PASS_COMPUTE; params.glsl_shader = shader.c_str();
+        params.descriptors = descriptors; params.num_descriptors = build ? 4 : 5;
+        params.push_constants_size = sizeof(Constants);
+        pass = pl_pass_create(gpu, &params);
+        return pass;
+    }
+    VulkanUploadCache lookupCache, mapCache;
     bool reserve(size_t sourceBytes, size_t mapBytes, size_t outputBytes,
                  size_t linearizationBytes) {
+        if (!linearization || linearization->params.size < linearizationBytes)
+            lookupCache.invalidate();
+        if (!map || map->params.size < mapBytes) mapCache.invalidate();
         const auto max = gpu->limits.max_ssbo_size;
         if ((!borrowedSource && sourceBytes > max) || mapBytes > max || outputBytes > max ||
             linearizationBytes > max) return false;
@@ -273,9 +309,11 @@ struct Device {
         }
         return (borrowedSource || (pl_buf_recreate(gpu, &source, &src) &&
                                   pl_buf_recreate(gpu, &sourceStage, &srcUpload))) &&
-            pl_buf_recreate(gpu, &map, &gains) &&
+            ((map && map->params.size >= mapBytes) ||
+             pl_buf_recreate(gpu, &map, &gains)) &&
             (directOutput || pl_buf_recreate(gpu, &output, &dst)) &&
-            pl_buf_recreate(gpu, &linearization, &lut) &&
+            ((linearization && linearization->params.size >= linearizationBytes) ||
+             pl_buf_recreate(gpu, &linearization, &lut)) &&
             pl_buf_recreate(gpu, &mapStage, &mapUpload) &&
             (directOutput || mappedOutput ||
              pl_buf_recreate(gpu, &outputStage, &dstDownload)) &&
@@ -324,6 +362,7 @@ void releaseVulkanGainBakeBufferDevice(const void* gpu) {
 bool bakeGainVulkan(const uint16_t* source,
                     const VulkanGainBakeParams& params,
                     uint8_t* destination, size_t destinationBytes, bool cfa) {
+    if (params.requirePackedOutputConsumer && !params.consumePackedOutput) return false;
     const auto& map = params.map;
     const bool genericMaps = !params.maps.empty();
     const bool externalTexture = params.textureSource &&
@@ -486,6 +525,8 @@ bool bakeGainVulkan(const uint16_t* source,
                       ? device->initExternal(static_cast<pl_gpu>(params.bufferSource->gpu), false)
                       : device->init())) { device.reset(); return false; }
     }
+    if (externalBuffer && params.bufferSource->deviceLease)
+        device->sourceDeviceLease = params.bufferSource->deviceLease;
     if (genericMaps && !device->ensureMultiPass(cfa)) return false;
     const size_t rowBytes = (rowSamples * params.outputBits + 7) / 8;
     const size_t wordsPerRow = (rowBytes + 3) / 4;
@@ -561,6 +602,10 @@ bool bakeGainVulkan(const uint16_t* source,
         pl_buf_write(device->gpu, device->sourceStage, 0,
                      source, sourceBytes);
     }
+    std::vector<uint8_t> mapData(mapBytes);
+    const auto writeMap = [&](size_t offset, const void* data, size_t bytes) {
+        std::memcpy(mapData.data() + offset, data, bytes);
+    };
     if (genericMaps) {
         uint32_t floatOffset = 0;
         for (uint32_t i = 0; i < mapCount; ++i) {
@@ -575,16 +620,11 @@ bool bakeGainVulkan(const uint16_t* source,
             uint32_t shape[4] = {current.width, current.height,
                                  current.channels, floatOffset};
             uint32_t pitch[4] = {current.rowPitch, current.colPitch, 0u, 0u};
-            pl_buf_write(device->gpu, device->mapStage,
-                         i * 16u, bounds, sizeof(bounds));
-            pl_buf_write(device->gpu, device->mapStage,
-                         512u + i * 16u, axes, sizeof(axes));
-            pl_buf_write(device->gpu, device->mapStage,
-                         1024u + i * 16u, shape, sizeof(shape));
-            pl_buf_write(device->gpu, device->mapStage,
-                         1536u + i * 16u, pitch, sizeof(pitch));
-            pl_buf_write(device->gpu, device->mapStage,
-                         2048u + static_cast<size_t>(floatOffset) * sizeof(float),
+            writeMap(i * 16u, bounds, sizeof(bounds));
+            writeMap(512u + i * 16u, axes, sizeof(axes));
+            writeMap(1024u + i * 16u, shape, sizeof(shape));
+            writeMap(1536u + i * 16u, pitch, sizeof(pitch));
+            writeMap(2048u + static_cast<size_t>(floatOffset) * sizeof(float),
                          current.data->data(), current.data->size() * sizeof(float));
             floatOffset += static_cast<uint32_t>(current.data->size());
         }
@@ -595,33 +635,29 @@ bool bakeGainVulkan(const uint16_t* source,
                                   current.right, current.bottom};
             float axes[4] = {current.originH, current.originV,
                              current.spacingH, current.spacingV};
-            pl_buf_write(device->gpu, device->mapStage,
-                         i * 16, bounds, sizeof(bounds));
-            pl_buf_write(device->gpu, device->mapStage,
-                         64 + i * 16, axes, sizeof(axes));
-            pl_buf_write(device->gpu, device->mapStage,
-                         128 + static_cast<size_t>(i) * first.data->size() * sizeof(float),
+            writeMap(i * 16, bounds, sizeof(bounds));
+            writeMap(64 + i * 16, axes, sizeof(axes));
+            writeMap(128 + static_cast<size_t>(i) * first.data->size() * sizeof(float),
                          current.data->data(), current.data->size() * sizeof(float));
         }
     } else {
     uint32_t mapBounds[4] = {map.left, map.top, map.right, map.bottom};
     float mapAxes[4] = {map.originH, map.originV, map.spacingH, map.spacingV};
-    pl_buf_write(device->gpu, device->mapStage, 0, mapBounds, sizeof(mapBounds));
-    pl_buf_write(device->gpu, device->mapStage, 16, mapAxes, sizeof(mapAxes));
-    pl_buf_write(device->gpu, device->mapStage, 32,
+    writeMap(0, mapBounds, sizeof(mapBounds));
+    writeMap(16, mapAxes, sizeof(mapAxes));
+    writeMap(32,
                  map.data->data(), map.data->size() * sizeof(float));
     }
     if (!externalSource)
         pl_buf_copy(device->gpu, device->source, 0,
                     device->sourceStage, 0, sourceBytes);
-    pl_buf_copy(device->gpu, device->map, 0,
-                device->mapStage, 0, mapBytes);
+    device->mapCache.upload(device->gpu, device->map, device->mapStage,
+                            mapData.data(), mapBytes);
     if (hasLogLookup) {
-        pl_buf_write(device->gpu, device->linearizationStage, 0,
-                     params.logLookup->data(), linearizationBytes);
-        pl_buf_copy(device->gpu, device->linearization, 0,
-                    device->linearizationStage, 0, linearizationBytes);
+        device->lookupCache.upload(device->gpu, device->linearization,
+            device->linearizationStage, params.logLookup->data(), linearizationBytes);
     } else if (hasLinearization) {
+        device->lookupCache.invalidate();
         std::vector<uint32_t> packedTable(32768u);
         const auto& table = *params.linearization;
         for (uint32_t index = 0; index < 32768u; ++index) {
@@ -637,7 +673,7 @@ bool bakeGainVulkan(const uint16_t* source,
                     device->linearizationStage, 0, linearizationBytes);
     }
     const auto uploaded = rawpreamp::diagnosticNow();
-    pl_desc_binding bindings[4] = {};
+    pl_desc_binding bindings[5] = {};
     bindings[0].object = externalTexture
         ? params.textureSource->texture
         : externalBuffer ? params.bufferSource->buffer
@@ -663,7 +699,58 @@ bool bakeGainVulkan(const uint16_t* source,
     run.compute_groups[2] = 1;
     if (run.compute_groups[0] > device->gpu->limits.max_dispatch[0] ||
         run.compute_groups[1] > device->gpu->limits.max_dispatch[1]) return false;
+    const bool spatial = genericMaps
+        ? std::any_of(params.maps.begin(), params.maps.end(), [](const auto& m) { return m.width > 1 || m.height > 1; })
+        : first.width > 1 || first.height > 1;
+    std::vector<uint8_t> spatialKey;
+    if (spatial) {
+        const uint32_t shape[] = {params.width, params.height, params.channels, cfa ? 1u : 0u,
+            genericMaps ? 1u : 0u, constants.mapShape[0], constants.mapShape[1], constants.mapShape[2], constants.flags & 8u};
+        spatialKey.resize(sizeof(shape) + mapData.size());
+        std::memcpy(spatialKey.data(), shape, sizeof(shape));
+        std::memcpy(spatialKey.data() + sizeof(shape), mapData.data(), mapData.size());
+    }
+    const uint32_t fieldChannels = cfa ? 1u : 3u;
+    auto field = device->spatialGains.acquire(device->gpu, spatialKey,
+        size_t(params.width) * params.height * fieldChannels * sizeof(float), fieldChannels,
+        [&](pl_buf target) {
+            const auto build = device->spatialPass(cfa, genericMaps, true);
+            const auto use = device->spatialPass(cfa, genericMaps, false);
+            if (!build || !use) return false;
+            auto fieldBindings = std::array<pl_desc_binding,5>{};
+            std::copy(std::begin(bindings), std::end(bindings), fieldBindings.begin());
+            fieldBindings[2].object = target;
+            auto fieldRun = run;
+            fieldRun.pass = build; fieldRun.timer = nullptr; fieldRun.desc_bindings = fieldBindings.data();
+            const uint32_t groups = uint32_t((uint64_t(params.width) * params.height + 255u) / 256u);
+            fieldRun.compute_groups[0] = std::min(groups, device->gpu->limits.max_dispatch[0]);
+            fieldRun.compute_groups[1] = (groups + fieldRun.compute_groups[0] - 1u) / fieldRun.compute_groups[0];
+            if (fieldRun.compute_groups[1] > device->gpu->limits.max_dispatch[1]) return false;
+            pl_pass_run(device->gpu, &fieldRun);
+            return true;
+        });
+    if (field) {
+        bindings[4].object = field;
+        run.pass = device->spatialPass(cfa, genericMaps, false);
+    }
     pl_pass_run(device->gpu, &run);
+    if (externalBuffer && params.bufferSource->validationBuffer) {
+        // At the terminal output stage inspect only decode validity. Invalid
+        // quantized codes restart from the compressed source without downloading pixels.
+        // BakeState serializes this device's submissions and status reads.
+        if (!device->validationStage) {
+            pl_buf_params read{};
+            read.size = sizeof(uint32_t); read.host_readable = true;
+            device->validationStage = pl_buf_create(device->gpu, &read);
+        }
+        if (!device->validationStage) return false;
+        pl_buf_copy(device->gpu, device->validationStage, 0,
+            static_cast<pl_buf>(params.bufferSource->validationBuffer), 0, sizeof(uint32_t));
+        uint32_t valid = 0;
+        const bool ok = pl_buf_read(device->gpu, device->validationStage, 0,
+            &valid, sizeof(valid)) && valid == 1;
+        if (!ok) return false;
+    }
     const VulkanPackedImage packedImage{
         device->gpu, device->directOutput ? device->directOutput : device->output,
         params.width, params.height, params.channels, params.outputBits,
@@ -677,6 +764,7 @@ bool bakeGainVulkan(const uint16_t* source,
                 params.outputBits);
         return true;
     }
+    if (params.requirePackedOutputConsumer) return false;
     const size_t firstDownloadBytes = device->splitOutput
         ? (outputBytes / 2) & ~size_t{63} : outputBytes;
     if (!device->directOutput)

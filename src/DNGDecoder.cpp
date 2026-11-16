@@ -66,6 +66,7 @@ void prepareGpuJpegConsumer(VulkanGainBakeParams& params,
                             std::vector<uint8_t>* jpegOutput,
                             std::vector<std::vector<uint8_t>>* tileOutput) {
     if (!jpegOutput && !tileOutput) return;
+    params.requirePackedOutputConsumer = params.bufferSource != nullptr;
     if (jpegOutput) jpegOutput->clear();
     if (tileOutput) tileOutput->clear();
     if (rawpreamp::debugEnvironment("RAWPREAMP_GPU_JPEG_DISABLE") ||
@@ -75,8 +76,6 @@ void prepareGpuJpegConsumer(VulkanGainBakeParams& params,
         if (image.bits < 8 || image.bits > 16) return false;
         if (tileOutput) {
             const auto shape = jpeg92TileShape(image.channels);
-            if (image.width % shape.width || image.height % shape.height)
-                return false;
             return jpegEncodeTiledVulkanPackedBuffer(
                 image.gpu, image.buffer, image.width, image.height,
                 image.channels, image.bits, image.wordsPerRow,
@@ -5432,6 +5431,9 @@ static bool decodeOrCanonicalizeDng(std::vector<uint8_t>& data, bool backgroundW
                         return downloadVulkanDecodedJpegImage(*resident, pixels, samples);
                     };
                     decodedImage->gpuImage = std::move(image);
+                    if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
+                        spdlog::info("GALLERY_PERF event=dng_gpu_jpeg_tiled_decode width={} height={} channels={} tiles={} resident=true",
+                            width, height, channels, expectedCount);
                     return true;
                 }
             }
@@ -6398,7 +6400,7 @@ bool DNGDecoder::applyLogTransform(std::vector<uint8_t>& data, LogTransformMode 
     if (data.size() & 1u) data.push_back(0);
     const uint32_t tableOffset=static_cast<uint32_t>(data.size());
     data.resize(data.size()+static_cast<size_t>(storedWhite+1)*2);
-    const auto logLinearization = makeLog60LinearizationTable(storedWhite, curve);
+    const auto& logLinearization = cachedLog60LinearizationTable(storedWhite, curve);
     for (uint32_t i=0;i<=storedWhite;++i)
         write16(data.data()+tableOffset+static_cast<size_t>(i)*2,
                 logLinearization[i],little);
@@ -6613,8 +6615,11 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
         LogTransformMode mode, uint32_t quantizationWhite,
         bool highQuality, uint32_t ditherSeed,
         std::vector<uint8_t>* gpuJpeg,
-        std::vector<std::vector<uint8_t>>* gpuJpegTiles, LogCurve curve) {
-    if (!logReductionBits(mode)) return false;
+        std::vector<std::vector<uint8_t>>* gpuJpegTiles, LogCurve curve,
+        const VulkanGainBakeBufferSource* bufferSource) {
+    const bool log = logReductionBits(mode) != 0;
+    if ((!log && !bufferSource) ||
+        (bufferSource && (!bufferSource->gpu || !bufferSource->buffer))) return false;
     bool little = true;
     const auto entries = findTiffEntries(data, little);
     if (!little) return false;
@@ -6648,8 +6653,16 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
         !offsetsE || !countsE || !whiteE || offsetsE->count != 1 ||
         countsE->count != 1 || !bitsE->count ||
         (bitsE->type != TIFF_TYPE_SHORT && bitsE->type != TIFF_TYPE_LONG) ||
-        (countsE->type != TIFF_TYPE_SHORT && countsE->type != TIFF_TYPE_LONG) ||
-        find(TIFF_TAG_LINEARIZATION_TABLE)) return false;
+        (countsE->type != TIFF_TYPE_SHORT && countsE->type != TIFF_TYPE_LONG)) return false;
+    const auto linearizationE = find(TIFF_TAG_LINEARIZATION_TABLE);
+    std::vector<uint16_t> sourceLinearization;
+    if (linearizationE) {
+        if (!bufferSource || linearizationE->type != TIFF_TYPE_SHORT ||
+            !linearizationE->count || linearizationE->count > 65536) return false;
+        sourceLinearization.resize(linearizationE->count);
+        for (size_t i = 0; i < sourceLinearization.size(); ++i)
+            sourceLinearization[i] = read16(data.data() + linearizationE->valueOffset + i * 2, little);
+    }
     auto scalar = [&](const TiffEntry& entry, uint32_t index = 0) -> uint32_t {
         const size_t at = entry.valueOffset + static_cast<size_t>(index) *
             (entry.type == TIFF_TYPE_SHORT ? 2u : 4u);
@@ -6669,10 +6682,11 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
     if (pixelCount > std::numeric_limits<uint32_t>::max() /
                          (channels * sizeof(uint16_t))) return false;
     const uint64_t sampleCount = pixelCount * channels;
-    const uint32_t encodedWhite = logStoredWhite(mode, quantizationWhite,
-                                                 sourceWhite);
-    const uint32_t outputBits = logStoredBits(
-        static_cast<uint16_t>(encodedWhite));
+    const uint32_t encodedWhite = log
+        ? logStoredWhite(mode, quantizationWhite, sourceWhite) : sourceWhite;
+    const uint32_t outputBits = log ? logStoredBits(static_cast<uint16_t>(encodedWhite))
+        : utils::evenBitsNeeded(static_cast<uint16_t>(linearizationE
+            ? linearizationE->count - 1u : sourceWhite));
     const size_t rowBytes =
         (static_cast<size_t>(width) * channels * outputBits + 7u) / 8u;
     const size_t packedBytes = rowBytes * height;
@@ -6689,11 +6703,13 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
     params.height = height;
     params.channels = channels;
     params.outputBits = outputBits;
-    params.sourceNominalWhite = 65535;
+    params.sourceNominalWhite = log && linearizationE ? linearizationE->count - 1u : 65535;
+    if (log && linearizationE) params.linearization = &sourceLinearization;
     params.destinationWhite = static_cast<float>(sourceWhite);
     params.encodedWhite = encodedWhite;
     params.ditherSeed = ditherSeed;
-    params.log60 = true;
+    params.log60 = log;
+    params.bufferSource = bufferSource;
     params.llog60 = curve == LogCurve::LLOG60;
     params.logHighQuality = highQuality;
     params.map = VulkanRgbGainMap{1, 1, channels, 0, 0, width, height,
@@ -6701,7 +6717,7 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
     if (channels == 1) {
         params.cfaMapCount = 1;
         params.cfaMaps[0] = params.map;
-    } else {
+    } else if (log) {
         params.logLookup = &cachedLog60EncodeLookup(
             0.0, static_cast<double>(sourceWhite), encodedWhite, curve);
     }
@@ -6710,8 +6726,9 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
             ? scalar(*blackE, std::min(channel, blackE->count - 1)) : 0;
         if (black >= sourceWhite) return false;
         params.black[channel] = static_cast<float>(black);
-        params.scale[channel] = static_cast<float>(sourceWhite) /
-            static_cast<float>(sourceWhite - black);
+        params.destinationBlack[channel] = log ? 0.0f : static_cast<float>(black);
+        params.scale[channel] = log ? static_cast<float>(sourceWhite) /
+            static_cast<float>(sourceWhite - black) : 1.0f;
     }
     prepareGpuJpegConsumer(params, gpuJpeg, gpuJpegTiles);
     std::vector<uint8_t> packed(packedBytes);
@@ -6737,8 +6754,8 @@ bool DNGDecoder::bakeLogStripVulkan(std::vector<uint8_t>& data,
     else if (countsE->type == TIFF_TYPE_LONG)
         write32(data.data() + countsE->valueOffset, packedBytes, little);
     else throw std::runtime_error("Invalid DNG strip count after GPU LOG bake");
-    if (!applyLogTransform(data, mode, quantizationWhite, highQuality, true,
-                           ditherSeed, curve) ||
+    if ((log && !applyLogTransform(data, mode, quantizationWhite, highQuality, true,
+                           ditherSeed, curve)) ||
         !replaceTiffStrip(data, offset, oldBytes, {}, little,
                           nullptr, packedBytes, true))
         throw std::runtime_error("Could not finalize GPU LOG DNG strip");
@@ -7174,7 +7191,8 @@ bool bakeDecodedPreviewGainMaps(DecodedDNGImage& image,
                                 bool* gainMapApplied = nullptr,
                                 uint16_t fusedLogWhite = 0,
                                 PreviewFrame* deferredFrame = nullptr,
-                                bool preferVulkan = true) {
+                                bool preferVulkan = true,
+                                uint32_t sourceParityOffset = 1) {
     if (gainMapApplied) *gainMapApplied = false;
     if (!previewHasGainToBake(image, settings)) return true;
     std::vector<GainMap> maps = image.opcodeList2;
@@ -7217,8 +7235,9 @@ bool bakeDecodedPreviewGainMaps(DecodedDNGImage& image,
     // GPU succeeds so a device failure can fall through to the CPU bake.
     const uint32_t phaseGroup = static_cast<uint32_t>(
         std::max(1, image.layout.cfaRepeatSize / 2));
-    if (deferredFrame && !rgb && phaseGroup == 1 && sourceScale == 1 &&
-        sourceWidth == image.layout.width && sourceHeight == image.layout.height &&
+    if (deferredFrame && !rgb && phaseGroup == 1 &&
+        uint64_t(sourceWidth) == uint64_t(image.layout.width) * sourceScale &&
+        uint64_t(sourceHeight) == uint64_t(image.layout.height) * sourceScale &&
         maps.size() <= 32 &&
         std::all_of(maps.begin(), maps.end(), [](const GainMap& map) {
             return validGainMap(map) &&
@@ -7226,6 +7245,7 @@ bool bakeDecodedPreviewGainMaps(DecodedDNGImage& image,
         })) {
         auto prepared = std::make_shared<VulkanGalleryBayerGain>();
         prepared->phase = cfaPhase;
+        prepared->sourceParityOffset = sourceParityOffset;
         prepared->encodedWhite = fusedLogWhite;
         prepared->ditherSeed = image.ditherSeed;
         prepared->highQualityDither = settings.options & RENDER_OPT_LOG_HQ;
@@ -7332,12 +7352,12 @@ bool bakeDecodedPreviewGainMaps(DecodedDNGImage& image,
     if (debugGainMap)
         std::fill(image.samples.begin(), image.samples.end(),
                   std::numeric_limits<uint16_t>::max());
-    auto sourceCoordinate = [rgb](uint32_t coordinate, uint32_t scale,
+    auto sourceCoordinate = [rgb, sourceParityOffset](uint32_t coordinate, uint32_t scale,
                                   uint32_t limit) {
         // Match reduceRGB's center sample for RGB; preserve Bayer phase for CFA.
         return std::min(limit - 1, coordinate * scale +
                         (scale > 1
-                             ? (rgb ? (scale - 1) / 2 : (coordinate & 1u))
+                             ? (rgb ? (scale - 1) / 2 : (coordinate & 1u) * sourceParityOffset)
                              : 0u));
     };
     std::vector<GainMapAxes> axes(maps.size());
@@ -7404,9 +7424,7 @@ bool bakeDecodedPreviewGainMaps(DecodedDNGImage& image,
     const auto* logLookup = fusedLogWhite
         ? &cachedLog60EncodeLookup(0.0, 65535.0, fusedLogWhite)
         : nullptr;
-    const auto linearization = fusedLogWhite
-        ? makeLog60LinearizationTable(fusedLogWhite)
-        : std::vector<uint16_t>{};
+    const auto& linearization = cachedLog60LinearizationTable(fusedLogWhite);
     const bool logHq = settings.options & RENDER_OPT_LOG_HQ;
     auto bakeRows = [&](uint32_t beginY, uint32_t endY) {
         std::vector<float> rgbVertical;
@@ -7496,17 +7514,55 @@ void applyCfaPreviewLog(DecodedDNGImage& image, const RenderSettings& settings,
         {image.metadata.blackLevel[0], image.metadata.blackLevel[1],
          image.metadata.blackLevel[2], image.metadata.blackLevel[3]},
         white, encodedWhite, settings.options & RENDER_OPT_LOG_HQ, image.ditherSeed);
-    const auto table = makeLog60LinearizationTable(encodedWhite);
+    const auto& table = cachedLog60LinearizationTable(encodedWhite);
     applyLinearizationTable(image.samples.data(), image.samples.size(), table);
     image.metadata.blackLevel.fill(0.0f);
     image.metadata.whiteLevel.fill(65535.0f);
     image.metadata.blackLevelCount = image.metadata.whiteLevelCount = 4;
 }
 
+// Mirror resident reduction during recovery using the original source callback.
+// Capture only CPU recovery and geometry, not another GPU image allocation.
+std::function<bool(uint16_t*, size_t)> makeReducedPreviewRecovery(
+        const DNGGpuImage& source, uint32_t width, uint32_t height,
+        uint32_t scale, bool cfa, bool bin) {
+    return [download = source.download, sourceWidth = source.width,
+            sourceHeight = source.height, channels = source.channels,
+            width, height, scale, cfa, bin](uint16_t* pixels, size_t count) {
+        if (!pixels || !download || !scale || !channels ||
+            count != uint64_t(width) * height * channels ||
+            uint64_t(sourceWidth) * sourceHeight * channels > SIZE_MAX / sizeof(uint16_t))
+            return false;
+        std::vector<uint16_t> original(size_t(sourceWidth) * sourceHeight * channels);
+        if (!download(original.data(), original.size())) return false;
+        if (bin) {
+            uint32_t outputWidth = 0, outputHeight = 0;
+            std::vector<uint16_t> output;
+            utils::binHigherCFA(original, output, sourceWidth, sourceHeight, scale,
+                                outputWidth, outputHeight, 0);
+            if (outputWidth != width || outputHeight != height || output.size() != count)
+                return false;
+            std::copy(output.begin(), output.end(), pixels);
+        } else {
+            for (uint32_t y = 0; y < height; ++y) {
+                const uint32_t sy = y * scale + (cfa ? (y & 1u) : (scale - 1u) / 2u);
+                if (sy >= sourceHeight) return false;
+                for (uint32_t x = 0; x < width; ++x) {
+                    const uint32_t sx = x * scale + (cfa ? (x & 1u) : (scale - 1u) / 2u);
+                    if (sx >= sourceWidth) return false;
+                    std::copy_n(original.data() + (size_t(sy) * sourceWidth + sx) * channels,
+                                channels, pixels + (size_t(y) * width + x) * channels);
+                }
+            }
+        }
+        return true;
+    };
+}
+
 std::function<bool(std::vector<uint16_t>&)> makeCfaPreviewRecovery(
         const DecodedDNGImage& source, const RenderSettings& settings,
         uint32_t sourceWidth, uint32_t sourceHeight, uint16_t logWhite,
-        uint32_t sourceScale = 1) {
+        uint32_t sourceScale = 1, uint32_t sourceParityOffset = 1) {
     DecodedDNGImage fallback;
     fallback.layout = source.layout;
     fallback.storedBitsPerSample = source.storedBitsPerSample;
@@ -7514,13 +7570,13 @@ std::function<bool(std::vector<uint16_t>&)> makeCfaPreviewRecovery(
     fallback.opcodeList2 = source.opcodeList2;
     fallback.opcodeList3 = source.opcodeList3;
     fallback.ditherSeed = source.ditherSeed;
-    return [fallback = std::move(fallback), settings, sourceWidth, sourceHeight, logWhite, sourceScale]
+    return [fallback = std::move(fallback), settings, sourceWidth, sourceHeight, logWhite, sourceScale, sourceParityOffset]
             (std::vector<uint16_t>& samples) {
         auto recovered = fallback;
         recovered.samples = samples;
         bool gainApplied = false;
         if (!bakeDecodedPreviewGainMaps(recovered, settings, sourceWidth,
-                sourceHeight, sourceScale, &gainApplied, logWhite, nullptr, false)) return false;
+                sourceHeight, sourceScale, &gainApplied, logWhite, nullptr, false, sourceParityOffset)) return false;
         if (logWhite && !gainApplied) applyCfaPreviewLog(recovered, settings, logWhite);
         samples = std::move(recovered.samples);
         return true;
@@ -7545,11 +7601,45 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
                                bool applyPreviewScale,
                                bool retainSourceSamples) {
     if (image.gpuImage) {
+        std::optional<DecodedDNGImage> originalImage;
         auto resident = image.gpuImage;
         const uint32_t sourceWidth = image.layout.width, sourceHeight = image.layout.height;
-        const uint32_t proxyScale = applyPreviewScale && (settings.options & RENDER_OPT_DRAFT)
+        uint32_t proxyScale = applyPreviewScale && (settings.options & RENDER_OPT_DRAFT)
             ? uint32_t(std::max(1, settings.draftScale)) : 1u;
         const bool cfa = image.layout.pixels == DNGPixelLayout::CFA;
+        uint32_t topologyScale = 1;
+        const bool explicitBinning = settings.quadBayerOption == QuadBayerMode::Binning ||
+            settings.quadBayerOption == QuadBayerMode::Bin8x8To4x4;
+        // The fast higher-CFA preview shares the CPU topology reduction:
+        // average same-color blocks first, then use the ordinary Bayer pipeline.
+        if (cfa && image.layout.cfaRepeatSize == 4 && settings.streamingPreview &&
+            applyPreviewScale && !retainSourceSamples && !frame.clippingRequested &&
+            image.residentLinearization.empty() &&
+            !rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_FORCE_CPU") &&
+            !(settings.options & (RENDER_OPT_CROPPING | RENDER_OPT_REMOSAIC_TO_BAYER)) &&
+            !(settings.options & RENDER_OPT_HIGHER_CFA_HQ)) {
+            VulkanResidentImage input, binned;
+            input.gpu = resident->gpu; input.buffer = resident->buffer;
+            input.width = resident->width; input.height = resident->height;
+            input.channels = resident->channels; input.bits = image.storedBitsPerSample;
+            input.wordsPerRow = input.width / 2u;
+            input.lease = resident->lease; input.deviceLease = resident->deviceLease;
+            if (binVulkanResidentCfa(input, 2, binned)) {
+                auto reduced = std::make_shared<DNGGpuImage>(*resident);
+                reduced->buffer = binned.buffer;
+                reduced->width = binned.width; reduced->height = binned.height;
+                reduced->lease = binned.lease;
+                reduced->download = makeReducedPreviewRecovery(*resident,
+                    binned.width, binned.height, 2, true, true);
+                originalImage = image;
+                resident = std::move(reduced);
+                image.gpuImage = resident;
+                image.layout.width = resident->width; image.layout.height = resident->height;
+                image.layout.cfaRepeatSize = 2;
+                topologyScale = 2;
+                if (!explicitBinning) proxyScale = std::max(1u, proxyScale / topologyScale);
+            }
+        }
         const bool gain = previewHasGainToBake(image, settings);
         const bool encodeLog = applyPreviewScale &&
             (settings.options & RENDER_OPT_LOG_TRANSFORM) &&
@@ -7572,23 +7662,22 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
         PreviewFrame deferred;
         deferred.sourceFrameIndex = frame.sourceFrameIndex;
         bool residentReady = compatible && (!gain || bakeDecodedPreviewGainMaps(prepared, settings,
-                image.layout.width, image.layout.height, 1,
+                sourceWidth, sourceHeight, topologyScale,
                 &deferred.gainMapApplied, logWhite, &deferred));
         if (residentReady && proxyScale > 1) {
-            VulkanDecodedJpegImage input, reduced;
+            VulkanResidentImage input, reduced;
             input.gpu = resident->gpu; input.buffer = resident->buffer;
             input.width = resident->width; input.height = resident->height;
             input.channels = resident->channels; input.bits = image.storedBitsPerSample;
             input.wordsPerRow = input.width * input.channels / 2u;
-            input.lease = resident->lease;
-            if (downscaleVulkanDecodedJpegImage(input, proxyScale, cfa, reduced)) {
+            input.lease = resident->lease; input.deviceLease = resident->deviceLease;
+            if (downscaleVulkanResidentImage(input, proxyScale, cfa, reduced)) {
                 auto proxy = std::make_shared<DNGGpuImage>(*resident);
                 proxy->buffer = reduced.buffer;
                 proxy->width = reduced.width; proxy->height = reduced.height;
                 proxy->lease = reduced.lease;
-                proxy->download = [reduced](uint16_t* samples, size_t count) {
-                    return downloadVulkanDecodedJpegImage(reduced, samples, count);
-                };
+                proxy->download = makeReducedPreviewRecovery(*resident,
+                    reduced.width, reduced.height, proxyScale, cfa, false);
                 resident = std::move(proxy);
                 image.layout.width = resident->width;
                 image.layout.height = resident->height;
@@ -7662,9 +7751,15 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
                 if (deferred.galleryCfaGain) {
                     deferred.galleryCfaGain->sourceWidth = sourceWidth;
                     deferred.galleryCfaGain->sourceHeight = sourceHeight;
-                    deferred.galleryCfaGain->sourceScale = proxyScale;
+                    deferred.galleryCfaGain->sourceScale = topologyScale * proxyScale;
+                    // Proxy parity shifts address the binned grid first; map
+                    // that shift back to the sensor before adding bin parity.
+                    const uint32_t parityOffset = (topologyScale > 1 ? 1u : 0u) +
+                        (proxyScale > 1 ? topologyScale : 0u);
+                    deferred.galleryCfaGain->sourceParityOffset = parityOffset;
                     deferred.galleryCfaRecoverCpu = makeCfaPreviewRecovery(
-                        image, settings, sourceWidth, sourceHeight, logWhite, proxyScale);
+                        image, settings, sourceWidth, sourceHeight, logWhite,
+                        topologyScale * proxyScale, parityOffset);
                 }
             } else {
                 for (size_t channel = 0; channel < 3; ++channel) {
@@ -7678,11 +7773,14 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
             }
             frame = std::move(deferred);
             if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
-                spdlog::info("GALLERY_PERF event=dng_gpu_jpeg_resident width={} height={} channels={} gain={} source_width={} source_height={} scale={}",
+                spdlog::info("GALLERY_PERF event=dng_gpu_jpeg_resident width={} height={} channels={} gain={} source_width={} source_height={} scale={} topology_scale={} proxy_scale={}",
                     resident->width, resident->height, resident->channels, frame.gainMapApplied,
-                    sourceWidth, sourceHeight, proxyScale);
+                    sourceWidth, sourceHeight, topologyScale * proxyScale, topologyScale, proxyScale);
             return true;
         }
+        // Unsupported processing restarts from the original topology. Do not
+        // bin twice or use reduced geometry for the CPU recovery decoder.
+        if (originalImage) { image = std::move(*originalImage); resident = image.gpuImage; }
         // Unsupported preview operations retain the ordinary shared processor.
         image.samples.resize(size_t(resident->width) * resident->height * resident->channels);
         if (!resident->download || !resident->download(image.samples.data(), image.samples.size()))
@@ -7731,7 +7829,7 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
     const uint32_t sourceWidth = image.layout.width;
     const uint32_t sourceHeight = image.layout.height;
     const auto proxyStarted = rawpreamp::diagnosticNow();
-    uint32_t gainMapSourceScale = 1;
+    uint32_t gainMapSourceScale = 1, gainMapParityOffset = 0;
     uint32_t remainingPreviewScale = requestedPreviewScale;
     const bool hasCrop = (settings.options & RENDER_OPT_CROPPING) &&
         !settings.cropTarget.empty() && settings.cropTarget != "0x0";
@@ -7768,6 +7866,7 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
             settings.quadBayerOption == QuadBayerMode::Bin8x8To4x4 &&
             topologyScale == 2 && image.layout.cfaRepeatSize == 4;
         gainMapSourceScale = topologyScale;
+        gainMapParityOffset = topologyScale > 1 ? 1u : 0u;
         // A selected binning mode is part of the requested gallery rendering,
         // not a substitute for its proxy scale. Only the implicit fast
         // higher-CFA topology reduction contributes toward that scale.
@@ -7809,6 +7908,7 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
         image.samples = std::move(reduced);
         image.layout.width = proxyWidth;
         image.layout.height = proxyHeight;
+        gainMapParityOffset += gainMapSourceScale;
         gainMapSourceScale *= remainingPreviewScale;
     }
     // RGB nearest-neighbor proxies need gain correction only at the samples
@@ -7867,12 +7967,13 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
         !(settings.options & (RENDER_OPT_REMOSAIC_TO_BAYER |
                               RENDER_OPT_HIGHER_CFA_HQ));
     auto recoverCpu = deferGalleryGain
-        ? makeCfaPreviewRecovery(image, settings, sourceWidth, sourceHeight, cfaLogWhite)
+        ? makeCfaPreviewRecovery(image, settings, sourceWidth, sourceHeight, cfaLogWhite,
+                                 gainMapSourceScale, gainMapParityOffset)
         : std::function<bool(std::vector<uint16_t>&)>{};
     if (!bakeDecodedPreviewGainMaps(
             image, settings, sourceWidth, sourceHeight, gainMapSourceScale,
             &frame.gainMapApplied, fuseCfaLog ? cfaLogWhite : 0,
-            deferGalleryGain ? &frame : nullptr)) return false;
+            deferGalleryGain ? &frame : nullptr, true, gainMapParityOffset)) return false;
     if (frame.galleryCfaGain) frame.galleryCfaRecoverCpu = std::move(recoverCpu);
     const bool cfaLogFused = fuseCfaLog && frame.gainMapApplied;
     const auto gainFinished = rawpreamp::diagnosticNow();
@@ -8202,7 +8303,7 @@ bool DNGDecoder::decodePreview(DecodedDNGImage image,
                            settings.options & RENDER_OPT_LOG_HQ,
                            image.ditherSeed);
     }
-    const auto linearization = makeLog60LinearizationTable(encodedWhite);
+    const auto& linearization = cachedLog60LinearizationTable(encodedWhite);
     for (size_t i = 0; i < normalizedSamples.size(); ++i) {
         const uint16_t normalized = linearization[std::min<size_t>(
             normalizedSamples[i], linearization.size() - 1)];
@@ -8961,8 +9062,8 @@ bool DNGDecoder::attachLosslessJPEGTiles(
         layout.storage != DNGStorageLayout::Strips ||
         (layout.pixels != DNGPixelLayout::CFA &&
          layout.pixels != DNGPixelLayout::LinearRGB) ||
-        layout.width % tileWidth || layout.height % tileHeight ||
-        uint64_t(layout.width / tileWidth) * (layout.height / tileHeight) !=
+        ((uint64_t(layout.width) + tileWidth - 1u) / tileWidth) *
+        ((uint64_t(layout.height) + tileHeight - 1u) / tileHeight) !=
             jpegTiles.size()) return false;
     std::vector<uint8_t> payload;
     std::vector<uint32_t> relativeOffsets, lengths;
@@ -9462,7 +9563,9 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
                               bool preferVulkan,
                               const VulkanGainBakeTextureSource* textureSource,
                               std::vector<uint8_t>* gpuJpeg,
-                              std::vector<std::vector<uint8_t>>* gpuJpegTiles, LogCurve curve) {
+                              std::vector<std::vector<uint8_t>>* gpuJpegTiles, LogCurve curve,
+                              const VulkanGainBakeBufferSource* bufferSource) {
+    if (bufferSource && (!bufferSource->gpu || !bufferSource->buffer)) return false;
     if (logFused) *logFused = false;
     const char* cpuOptSetting = rawpreamp::debugEnvironment("RAWPREAMP_GAIN_BAKE_CPU_OPT");
     const bool cpuOpt = !cpuOptSetting || cpuOptSetting[0] != '0';
@@ -9533,7 +9636,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
     const bool eligibleOpcode3 = hasOnlySinglePlaneGainMap(data, 3) &&
         opcode3Maps.size() == 1 && opcode3Maps.front().channels == 1;
     if (!colorOnly) consumeOpcode3 = eligibleOpcode3;
-    if (opcode2Maps.empty() && !consumeOpcode3) return true;
+    if (opcode2Maps.empty() && !consumeOpcode3) return bufferSource == nullptr;
 
     std::optional<double> updatedBaseline;
     std::optional<std::array<float, 3>> updatedNeutral;
@@ -9661,7 +9764,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
         stripBytes == sampleCount;
     bool inPlace = compression == TIFF_COMPRESSION_NONE &&
         (bits == 16 || packedGpuPlaceholder) &&
-        little == hostLittle && !linearizationE &&
+        little == hostLittle && (!linearizationE || bufferSource) &&
         sampleCount <= std::numeric_limits<uint32_t>::max() / sizeof(uint16_t) &&
         stripBytes == sampleCount * (packedGpuPlaceholder ? 1u : sizeof(uint16_t));
     if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_FORCE_DECODED_GAIN_BAKE"))
@@ -9670,7 +9773,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
         for (uint32_t i = 1; i < bitsE->count; ++i)
             if (scalar(*bitsE, i) != (packedGpuPlaceholder ? 8u : 16u)) inPlace = false;
     }
-    const bool deferLinearization = preferVulkan && !inPlace && linearizationE;
+    const bool deferLinearization = preferVulkan && (!inPlace || bufferSource) && linearizationE;
     std::vector<uint16_t> sourceLinearization;
     if (deferLinearization) {
         sourceLinearization.resize(linearizationE->count);
@@ -9848,13 +9951,15 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
     }
     uint32_t packedBits = fuseLog && packFusedLog
         ? logStoredBits(encodedWhite) : 16;
+    if (bufferSource && !fuseLog && packFusedLog)
+        packedBits = utils::evenBitsNeeded(static_cast<uint16_t>(destinationWhite));
     bool packDuringBake = packedBits < 16;
     size_t packedRowBytes = packDuringBake
         ? (static_cast<size_t>(width) * imageChannels * packedBits + 7) / 8 : 0;
     size_t packedBytes = packedRowBytes * height;
     if (packDuringBake && packedBytes > std::numeric_limits<uint32_t>::max())
         return false;
-    const bool directGpuStrip = textureSource && inPlace;
+    const bool directGpuStrip = (textureSource || bufferSource) && inPlace;
     const bool directGpuPacked = directGpuStrip && packDuringBake;
     std::vector<uint8_t> packedOutput;
     if (packDuringBake && !directGpuPacked)
@@ -9915,18 +10020,24 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
     // Build a full-resolution field only after seeing the same map twice.
     // Variable maps can use the direct per-row interpolation below without
     // allocating and writing another full-frame buffer on every frame.
-    std::shared_ptr<const std::vector<float>> cachedCfaGains;
+    std::shared_ptr<const std::vector<float>> cachedSpatialGains;
     bool gainFieldCacheHit = false;
     bool gainFieldWarmup = false;
     // Defer CPU-only interpolation until the GPU attempt has failed.
     auto prepareCpuGainField = [&] {
-        if (!cpuOpt || !(directCfaMaps || directScalarMap) ||
+        if (!cpuOpt || !(directCfaMaps || directScalarMap || (sourceIsRgb && imageChannels == 3)) ||
             static_cast<uint64_t>(width) * height > 16u * 1024u * 1024u)
             return;
         static std::mutex gainFieldMutex;
         static std::deque<std::pair<std::string,
             std::shared_ptr<const std::vector<float>>>> gainFields;
         std::string key = axisCache.key;
+        const auto append = [&](const auto& value) {
+            key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+        };
+        append(sourceIsRgb); append(imageChannels); append(phaseGroup);
+        append(colorOnly); append(gridColorSeparated); append(cfaPhase);
+
         for (const auto& map : maps)
             key.append(reinterpret_cast<const char*>(map.data.data()),
                        map.data.size() * sizeof(float));
@@ -9936,7 +10047,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
         const bool seenBefore = hit != gainFields.end();
         if (seenBefore) {
             gainFieldCacheHit = static_cast<bool>(hit->second);
-            cachedCfaGains = hit->second;
+            cachedSpatialGains = hit->second;
             auto entry = std::move(*hit);
             gainFields.erase(hit);
             gainFields.push_back(std::move(entry));
@@ -9945,13 +10056,41 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
             gainFields.emplace_back(std::move(key), nullptr);
             while (gainFields.size() > 2) gainFields.pop_front();
         }
-        if (!cachedCfaGains && seenBefore) {
+        if (!cachedSpatialGains && seenBefore) {
+            const size_t bytes = size_t(width) * height * imageChannels * sizeof(float);
+            size_t retained = 0;
+            for (const auto& entry : gainFields)
+                if (entry.second) retained += entry.second->size() * sizeof(float);
+            while (gainFields.size() > 1 && retained + bytes > 192u * 1024u * 1024u) {
+                if (gainFields.front().second) retained -= gainFields.front().second->size() * sizeof(float);
+                gainFields.pop_front();
+            }
             auto field = std::make_shared<std::vector<float>>(
-                static_cast<size_t>(width) * height);
+                static_cast<size_t>(width) * height * imageChannels);
             auto prepareRows = [&](uint32_t first, uint32_t last) {
                 std::array<std::vector<float>, 2> cfaVertical;
                 std::vector<float> scalarVertical;
+                std::vector<float> rgbVertical;
                 for (uint32_t y = first; y < last; ++y) {
+                    if (sourceIsRgb) {
+                        const auto row = directRgbMap
+                            ? std::optional<RgbGainRow>(RgbGainRow::prepare(maps.front(), axes.front(), y, rgbVertical))
+                            : std::nullopt;
+                        ScalarCfaGainRow scalar;
+                        if (directRgbScalarMap) {
+                            scalar = makeScalarCfaGainRow(maps.front(), axes.front(), y);
+                            scalar.blendVertical(scalarVertical);
+                        }
+                        for (uint32_t x = 0; x < width; ++x) {
+                            const auto rgb = row ? (fullRgbMap ? row->sampleUnchecked(x) : row->sample(x, y))
+                                : std::array<float,3>{1,1,1};
+                            const float luma = directRgbScalarMap ? scalar.sampleBlended(x, y, scalarVertical) : 1.0f;
+                            for (uint32_t channel = 0; channel < imageChannels; ++channel)
+                                (*field)[(size_t(y) * width + x) * imageChannels + channel] = directRgbMap
+                                    ? rgb[channel] : directRgbScalarMap ? luma : effectiveGain(x, y, channel);
+                        }
+                        continue;
+                    }
                     if (directScalarMap) {
                         if (fastScalarMap) {
                             const auto row = makeScalarCfaGainRow(
@@ -9991,7 +10130,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
                     height * (worker + 1) / gainWorkers);
             prepareRows(0, height / gainWorkers);
             for (auto& thread : threads) thread.join();
-            cachedCfaGains = field;
+            cachedSpatialGains = field;
             gainFields.back().second = std::move(field);
         }
     };
@@ -10018,18 +10157,18 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
                 transform == BakeTransformMode::Log60HighQuality> ditherRow(y, ditherSeed);
             const uint32_t cfaRowPhase = rgbImage ? 0u
                 : ((phaseGroup == 1 ? y : y / phaseGroup) & 1u) << 1u;
-            const auto cfaRowMaps = cpuOpt && directCfaMaps && !cachedCfaGains
+            const auto cfaRowMaps = cpuOpt && directCfaMaps && !cachedSpatialGains
                 ? makeScalarCfaGainRows(maps, axes, *directCfaIndices, y)
                 : std::array<ScalarCfaGainRow, 2>{};
             ScalarCfaGainRow scalarRowMap;
-            if ((fastScalarMap && !cachedCfaGains) || directRgbScalarMap) {
+            if ((fastScalarMap && !cachedSpatialGains) || (directRgbScalarMap && !cachedSpatialGains)) {
                 scalarRowMap = makeScalarCfaGainRow(maps.front(), axes.front(), y);
                 scalarRowMap.blendVertical(scalarVertical);
             }
-            if (cpuOpt && directCfaMaps && !cachedCfaGains)
+            if (cpuOpt && directCfaMaps && !cachedSpatialGains)
                 for (size_t parity = 0; parity < cfaVertical.size(); ++parity)
                     cfaRowMaps[parity].blendVertical(cfaVertical[parity]);
-            const auto rgbRow = directRgbMap
+            const auto rgbRow = directRgbMap && !cachedSpatialGains
                 ? std::optional<RgbGainRow>(RgbGainRow::prepare(
                     maps.front(), axes.front(), y, rgbVertical))
                 : std::nullopt;
@@ -10050,18 +10189,18 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
                     ? (fullRgbMap ? rgbRow->sampleUnchecked(x)
                                   : rgbRow->sample(x, y))
                     : std::array<float, 3>{1.0f, 1.0f, 1.0f};
-                const float rgbScalarGain = directRgbScalarMap
+                const float rgbScalarGain = directRgbScalarMap && !cachedSpatialGains
                     ? scalarRowMap.sampleBlended(x, y, scalarVertical) : 1.0f;
                 for (uint32_t channel = 0; channel < channels; ++channel) {
                     float gain;
-                    if (directRgbMap) {
+                    if (cachedSpatialGains) {
+                        gain = (*cachedSpatialGains)[(size_t(y) * width + x) * channels + channel];
+                    } else if (directRgbMap) {
                         gain = rgbGains[channel];
                     } else if (directRgbScalarMap) {
                         gain = rgbScalarGain;
                     } else {
-                        if (cachedCfaGains)
-                            gain = (*cachedCfaGains)[static_cast<size_t>(y) * width + x];
-                        else if (directCfaMaps && !cpuOpt) {
+                        if (directCfaMaps && !cpuOpt) {
                             const size_t mapIndex = mapsByParity[
                                 ((y & 1u) << 1u) | (x & 1u)][0];
                             const auto& map = maps[mapIndex];
@@ -10193,6 +10332,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
         gpuParams.encodedWhite = encodedWhite;
         gpuParams.ditherSeed = ditherSeed;
         gpuParams.textureSource = textureSource;
+        gpuParams.bufferSource = bufferSource;
         gpuParams.log60 = fuseLog;
         gpuParams.llog60 = curve == LogCurve::LLOG60;
         gpuParams.logHighQuality = logHighQuality;
@@ -10302,6 +10442,9 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
             spdlog::info("GALLERY_PERF event=gain_bake_vulkan used={} width={} height={} channels={} output_bits={}",
                 gpuBaked, width, height, imageChannels, packedBits);
     }
+    // A resident buffer must never fall through to processing its placeholder.
+    // The source adapter can restart from compressed bytes on the CPU.
+    if (bufferSource && !gpuBaked) return false;
     if (textureSource && !gpuBaked) {
         if (packedGpuPlaceholder) {
             recoveredGpuSamples.resize(sampleCount);
@@ -10500,7 +10643,7 @@ bool DNGDecoder::bakeGainMaps(std::vector<uint8_t>& data,
         spdlog::info("GALLERY_PERF event=gain_bake_stage width={} height={} channels={} maps={} color_only={} grid_separated={} in_place={} fused_log={} gain_field_cache={} workers={} concurrent_bakes={} map_prepare_ms={:.3f} decode_ms={:.3f} pixel_ms={:.3f} serialize_ms={:.3f} metadata_ms={:.3f}",
                      width, height, imageChannels, maps.size(), colorOnly,
                      gridColorSeparated, inPlace, fuseLog,
-                     cachedCfaGains ? (gainFieldCacheHit ? "hit" : "miss")
+                     cachedSpatialGains ? (gainFieldCacheHit ? "hit" : "miss")
                          : (gainFieldWarmup ? "warmup" : "disabled"),
                      workers, concurrentBakes,
                      std::chrono::duration<double, std::milli>(predecodeAt-bakeStarted).count(),

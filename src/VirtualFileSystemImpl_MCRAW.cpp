@@ -11,6 +11,7 @@
 #include "DNGDecoder.h"
 #include "GainMapBake.h"
 #include "VulkanGainBake.h"
+#include "VulkanRawDecode.h"
 #include "DataLevels.h"
 
 #include <motioncam/Decoder.hpp>
@@ -838,8 +839,48 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_MCRAW::materializeFi
         uint32_t cropWidth = 0, cropHeight = 0, strideOverride = 0;
         if (mSettings.options & RENDER_OPT_CROPPING)
             utils::parseCropTarget(mSettings.cropTarget, cropWidth, cropHeight, strideOverride);
-        decoder->loadFrame(timestamp, frameData, metadata, static_cast<int>(strideOverride));
+        VulkanResidentImage resident;
+        std::optional<CameraFrameMetadata> residentMetadata;
+        // Admit only settings whose complete pixel pipeline is GPU resident.
+        // Other modes decode on the CPU from the outset, never by downloading
+        // an intermediate GPU image.
+        const bool residentCandidate =
+            !rawpreamp::debugEnvironment("RAWPREAMP_RAW_GPU_DISABLE") &&
+            supportsRawFrameDecodeVulkan(decoder->encodedFrameFormat()) &&
+            (!mCalibration || !mCalibration->hasCfaSize || mCalibration->cfaSize == 2) &&
+            !strideOverride && !mSettings.cameraNativeStaging &&
+            !(mSettings.options & (RENDER_OPT_CROPPING | RENDER_OPT_DRAFT |
+                RENDER_OPT_REMOSAIC_TO_BAYER | RENDER_OPT_BAKE_ISO)) &&
+            (!mCalibration || !mCalibration->hasBadPixels ||
+                !processesBadPixels(mSettings.badPixelTreatment)) &&
+            std::all_of(mManualVignetteSidecars.candidates.begin(),
+                mManualVignetteSidecars.candidates.end(), [](const auto& candidate) {
+                    return std::all_of(candidate.nonGainMapOpcodes.begin(),
+                        candidate.nonGainMapOpcodes.end(), [](const auto& bytes) { return bytes.empty(); });
+                }) &&
+            (!outputCompression || (jpegCompression && isLosslessJpeg92(mSettings.jxlDistance)));
+        if (residentCandidate) {
+            decoder->loadEncodedFrame(timestamp, frameData, metadata);
+            residentMetadata = CameraFrameMetadata::parse(metadata);
+            const auto& source = *residentMetadata;
+            const int repeat = mCalibration && mCalibration->hasCfaSize
+                ? mCalibration->cfaSize : source.cfaSize;
+            if (repeat == 2 &&
+                source.width > 0 && source.height > 0 && source.width % 4 == 0)
+                rawFrameDecodeVulkan(decoder->encodedFrameFormat(),
+                    metadata.value("compressionType", 0), frameData.data(), frameData.size(),
+                    source.width, source.height, resident, source.linearizationTable.empty()
+                        ? 65535u : static_cast<uint32_t>(source.linearizationTable.size() - 1u));
+            frameData.clear();
+        }
+        if (!resident.buffer)
+            decoder->loadFrame(timestamp, frameData, metadata, static_cast<int>(strideOverride));
         const auto loadedAt = rawpreamp::diagnosticNow();
+        if (profile)
+            spdlog::info("GALLERY_PERF event=raw_decode mode=mounted source={} frame={} codec={} backend={} gpu_candidate={} load_ms={:.3f}",
+                mSrcPath, frameIt->second, static_cast<int>(decoder->encodedFrameFormat()),
+                resident.buffer ? "vulkan" : "cpu", residentCandidate,
+                std::chrono::duration<double, std::milli>(loadedAt-materializeStarted).count());
         RenderSettings frameSettings = mSettings;
         const auto renderPlan = vfs::planDngRender(
             entry, timestamp, mSourceFrames.front(), frameSettings, mFps,
@@ -853,7 +894,10 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_MCRAW::materializeFi
         std::optional<std::array<float, 3>> neutralOverride;
         if (mSettings.options & RENDER_OPT_SMOOTH_WHITE_BALANCE)
             neutralOverride = mSmoothedAsShotNeutrals.at(timestamp);
-        auto frameMetadata = CameraFrameMetadata::parse(metadata);
+        // Reuse the parsed GPU-admission metadata. CPU fallback may have
+        // replaced the JSON, so it must still parse the decoded source afresh.
+        auto frameMetadata = resident.buffer
+            ? std::move(*residentMetadata) : CameraFrameMetadata::parse(metadata);
         frameMetadata.filename = boost::filesystem::path(mSrcPath).filename().string();
         const auto sidecarMaps = vfs::loadSidecarGainMaps(
             mSidecarMetadata, frameIt->second, "gainMaps");
@@ -899,25 +943,21 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_MCRAW::materializeFi
             generationSettings.levels = "Dynamic";
         const auto nativePlan = utils::planDngFrameProcessing(
             frameSettings, frameMetadata, mCalibration);
-        const bool unpackedIntermediate = !frameMetadata.linearizationTable.empty() ||
+        const bool unpackedIntermediate = resident.buffer || !frameMetadata.linearizationTable.empty() ||
             (frameSettings.options &
              (RENDER_OPT_APPLY_VIGNETTE_CORRECTION | RENDER_OPT_LOG_TRANSFORM |
               RENDER_OPT_REMOSAIC_TO_BAYER)) ||
             nativePlan.cfaRepeatSize > 2 || renderPlan.scale > 1 ||
             frameSettings.cameraNativeStaging;
-        auto output = utils::generateDng(
-            frameData,
-            frameMetadata,
-            cameraConfig,
-            mFps,
-            renderPlan.outputFrameNumber,
-            mBaselineExpValue,
-            generationSettings,
-            mCalibration,
-            false,
-            exposureOverride,
-            neutralOverride,
-            nullptr, false, nullptr, unpackedIntermediate);
+        auto generate = [&](bool metadataOnly) {
+            return utils::generateDng(
+                frameData, frameMetadata, cameraConfig, mFps,
+                renderPlan.outputFrameNumber, mBaselineExpValue,
+                generationSettings, mCalibration, false,
+                exposureOverride, neutralOverride, nullptr, false, nullptr,
+                unpackedIntermediate, metadataOnly);
+        };
+        auto output = generate(resident.buffer != nullptr);
         if (!output)
             throw std::runtime_error("DNG generation returned no data");
         const auto generatedAt = rawpreamp::diagnosticNow();
@@ -963,7 +1003,28 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_MCRAW::materializeFi
         pixels.exposureTime = frameMetadata.exposureTime / 1.0e9;
         pixels.sourceName = boost::algorithm::iends_with(mSrcPath, ".mcpro") ? "mc24" : "MCRAW";
         pixels.ditherSeed = static_cast<uint32_t>(renderPlan.outputFrameNumber + 1);
-        vfs::processDngPixels(timed, frameSettings, pixels);
+        VulkanGainBakeBufferSource bufferSource{resident.gpu, resident.buffer,
+            resident.deviceLease, resident.validationBuffer};
+        if (resident.buffer) pixels.bufferSource = &bufferSource;
+        try {
+            vfs::processDngPixels(timed, frameSettings, pixels);
+        } catch (const std::exception& error) {
+            if (!resident.buffer) throw;
+            spdlog::warn("MCRAW resident processing failed; decoding original stream on CPU: {}",
+                         error.what());
+            decoder->loadFrame(timestamp, frameData, metadata, static_cast<int>(strideOverride));
+            auto fallback = generate(false);
+            if (!fallback) throw std::runtime_error("MCRAW CPU recovery failed");
+            timed = std::move(*fallback);
+            if (!mTelemetry->fillMissingDngMetadata(timed, frameIt->second))
+                throw std::runtime_error("Could not restore MCRAW capture metadata");
+            attachSidecarGainMapOpcodes(timed, frameIt->second);
+            pixels.bufferSource = nullptr;
+            vfs::processDngPixels(timed, frameSettings, pixels);
+        }
+        if (profile)
+            spdlog::info("GALLERY_PERF event=mcraw_pixel_storage source={} resident={}",
+                         mSrcPath, pixels.bufferSource != nullptr);
         const auto processedAt = rawpreamp::diagnosticNow();
         vfs::DngFinalizeOptions finalize;
         finalize.frameRate = mFps;
@@ -1102,10 +1163,57 @@ bool VirtualFileSystemImpl_MCRAW::materializePreviewFrame(
             utils::parseCropTarget(mSettings.cropTarget, cropWidth, cropHeight,
                                    strideOverride);
         const auto loadStarted = rawpreamp::diagnosticNow();
-        decoder->loadFrame(timestamp, frameData, metadata,
-                           static_cast<int>(strideOverride));
+        VulkanResidentImage resident;
+        std::optional<CameraFrameMetadata> residentMetadata;
+        const bool fastPreviewLayout = mSettings.streamingPreview &&
+            !retainSourceSamples && !preview.clippingRequested &&
+            supportsRawFrameDecodeVulkan(decoder->encodedFrameFormat()) &&
+            (!mCalibration || !mCalibration->hasCfaSize || (mCalibration->cfaSize == 2 || mCalibration->cfaSize == 4)) &&
+            !strideOverride &&
+            !(mSettings.options & (RENDER_OPT_CROPPING | RENDER_OPT_REMOSAIC_TO_BAYER |
+                RENDER_OPT_HIGHER_CFA_HQ | RENDER_OPT_BAKE_ISO)) &&
+            (!(mSettings.options & RENDER_OPT_DRAFT) || mSettings.draftScale <= 1 ||
+                mSettings.draftScale % 2 == 0) &&
+            (!mCalibration || !mCalibration->hasBadPixels ||
+                !processesBadPixels(mSettings.badPixelTreatment));
+        const bool residentPreview = fastPreviewLayout &&
+            !rawpreamp::debugEnvironment("RAWPREAMP_RAW_GPU_DISABLE") &&
+            !rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_FORCE_CPU");
+        if (residentPreview) {
+            decoder->loadEncodedFrame(timestamp, frameData, metadata);
+            residentMetadata = CameraFrameMetadata::parse(metadata);
+            const auto& source = *residentMetadata;
+            const int repeat = mCalibration && mCalibration->hasCfaSize
+                ? mCalibration->cfaSize : source.cfaSize;
+            if ((repeat == 2 || repeat == 4) &&
+                source.width > 0 && source.height > 0 && source.width % 4 == 0)
+                rawFrameDecodeVulkan(decoder->encodedFrameFormat(),
+                    metadata.value("compressionType", 0), frameData.data(), frameData.size(),
+                    source.width, source.height, resident, source.linearizationTable.empty()
+                        ? 65535u : static_cast<uint32_t>(source.linearizationTable.size() - 1u));
+            frameData.clear();
+        }
+        if (resident.buffer && !validateVulkanRawFrame(resident)) resident = {};
+        if (!resident.buffer)
+            decoder->loadFrame(timestamp, frameData, metadata,
+                               static_cast<int>(strideOverride));
         const auto loadFinished = rawpreamp::diagnosticNow();
-        auto frameMetadata = CameraFrameMetadata::parse(metadata);
+        if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
+            spdlog::info("GALLERY_PERF event=raw_decode mode=preview source={} frame={} codec={} backend={} gpu_candidate={} load_ms={:.3f}",
+                mSrcPath, frameIt->second, static_cast<int>(decoder->encodedFrameFormat()),
+                resident.buffer ? "vulkan" : "cpu", residentPreview,
+                std::chrono::duration<double, std::milli>(loadFinished-loadStarted).count());
+        if (!resident.buffer && (residentPreview ||
+                (mCalibration && mCalibration->hasCfaSize && mCalibration->cfaSize != 2)) &&
+            rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
+            spdlog::info("GALLERY_PERF event=raw_decode_fallback compression={} width={} height={} cfa={} calibration_cfa={}",
+                metadata.value("compressionType", 0), metadata.value("width", 0),
+                metadata.value("height", 0), residentMetadata ? residentMetadata->cfaSize : 0,
+                mCalibration && mCalibration->hasCfaSize ? mCalibration->cfaSize : 0);
+        // Reuse the parsed GPU-admission metadata. CPU fallback may have
+        // replaced the JSON, so it must still parse the decoded source afresh.
+        auto frameMetadata = resident.buffer
+            ? std::move(*residentMetadata) : CameraFrameMetadata::parse(metadata);
         frameMetadata.filename = boost::filesystem::path(mSrcPath).filename().string();
         const auto sidecarMaps = vfs::loadSidecarGainMaps(
             mSidecarMetadata, frameIt->second, "gainMaps");
@@ -1132,7 +1240,65 @@ bool VirtualFileSystemImpl_MCRAW::materializePreviewFrame(
         std::optional<std::array<float, 3>> neutralOverride;
         if (mSettings.options & RENDER_OPT_SMOOTH_WHITE_BALANCE)
             neutralOverride = mSmoothedAsShotNeutrals.at(timestamp);
-        if (spatialSidecar) {
+        if (resident.buffer) {
+            auto canonical = canonicalMcrawGenerationSettings(previewSettings);
+            std::shared_ptr<std::vector<uint8_t>> header;
+            try {
+                header = utils::generateDng(frameData, frameMetadata, cameraConfig,
+                    mFps, vfs::outputFrameNumber(entry), mBaselineExpValue, canonical,
+                    mCalibration, false, exposureOverride, neutralOverride,
+                    nullptr, false, nullptr, true, true);
+            } catch (const std::exception& error) {
+                spdlog::warn("Resident raw metadata staging unavailable; using CPU preview: {}", error.what());
+            }
+            if (header) {
+                attachSidecarGainMapOpcodes(*header, frameIt->second);
+                DecodedDNGImage image;
+                if (DNGDecoder::getImageLayout(*header, image.layout) &&
+                    DNGDecoder::getColorMetadata(*header, image.metadata)) {
+                    DNGDecoder::getGainMaps(*header, 2, image.opcodeList2);
+                    DNGDecoder::getGainMaps(*header, 3, image.opcodeList3);
+                    vfs::applyPreviewExposureOffset(image.metadata, mSettings);
+                    image.storedBitsPerSample = 16;
+                    image.residentLinearization = frameMetadata.linearizationTable;
+                    image.ditherSeed = static_cast<uint32_t>(vfs::outputFrameNumber(entry) + 1);
+                    image.timestamp = vfs::outputTimestamp(entry, timestamp,
+                        mSourceFrames.front(), mFps,
+                        mSettings.options & RENDER_OPT_FRAMERATE_CONVERSION);
+                    image.gpuImage = std::make_shared<DNGGpuImage>();
+                    image.gpuImage->gpu = resident.gpu;
+                    image.gpuImage->buffer = resident.buffer;
+                    image.gpuImage->width = resident.width;
+                    image.gpuImage->height = resident.height;
+                    image.gpuImage->channels = 1;
+                    image.gpuImage->lease = resident.lease;
+                    image.gpuImage->deviceLease = resident.deviceLease;
+                    // Recovery decodes the original stream on the CPU; it never
+                    // downloads an intermediate GPU image.
+                    image.gpuImage->download = [path = mSrcPath, timestamp]
+                        (uint16_t* samples, size_t count) {
+                        motioncam::Decoder source(rawpreamp::decoderSource(path));
+                        std::vector<uint8_t> bytes; nlohmann::json metadata;
+                        source.loadFrame(timestamp, bytes, metadata);
+                        if (bytes.size() != count * sizeof(uint16_t)) return false;
+                        std::memcpy(samples, bytes.data(), bytes.size());
+                        return true;
+                    };
+                    if (DNGDecoder::decodePreview(std::move(image), previewSettings,
+                            preview, true, false)) {
+                        return true;
+                    }
+                }
+            }
+            decoder->loadFrame(timestamp, frameData, metadata,
+                               static_cast<int>(strideOverride));
+        }
+        const int previewRepeat = mCalibration && mCalibration->hasCfaSize
+            ? mCalibration->cfaSize : frameMetadata.cfaSize;
+        // Match resident bin-first processing on CPU recovery as well. Gain,
+        // LOG and proxy operations then share DNGDecoder's reduced Bayer path.
+        if (spatialSidecar || (fastPreviewLayout && previewRepeat == 4 &&
+                frameMetadata.linearizationTable.empty())) {
             auto generationSettings = canonicalMcrawGenerationSettings(previewSettings);
             generationSettings.badPixelTreatment = mSettings.badPixelTreatment;
             DecodedDNGImage image;

@@ -1,15 +1,17 @@
 #include "CameraFrameMetadata.h"
+#include <utility>
 
 using json = nlohmann::json;
 
 namespace rawpreamp {
 
 CameraFrameMetadata CameraFrameMetadata::parse(const json& j) {
-    CameraFrameMetadata frame;
+    CameraFrameMetadata frame{};
+    frame.asShotNeutral.fill(1.0f);
 
     // Parse asShotNeutral array
     if (j.contains("asShotNeutral") && j["asShotNeutral"].is_array()) {
-        auto neutralArray = j["asShotNeutral"];
+        const auto& neutralArray = j["asShotNeutral"];
         for (size_t i = 0; i < 3 && i < neutralArray.size(); ++i) {
             frame.asShotNeutral[i] = neutralArray[i].get<float>();
         }
@@ -17,7 +19,7 @@ CameraFrameMetadata CameraFrameMetadata::parse(const json& j) {
 
     // Parse dynamicBlackLevel array
     if (j.contains("dynamicBlackLevel") && j["dynamicBlackLevel"].is_array()) {
-        auto blackLevelArray = j["dynamicBlackLevel"];
+        const auto& blackLevelArray = j["dynamicBlackLevel"];
         for (size_t i = 0; i < 4 && i < blackLevelArray.size(); ++i) {
             frame.dynamicBlackLevel[i] = blackLevelArray[i].get<float>();
         }
@@ -25,7 +27,7 @@ CameraFrameMetadata CameraFrameMetadata::parse(const json& j) {
 
     // Parse lens shading map (4 channels x height x width)
     if (j.contains("lensShadingMap") && j["lensShadingMap"].is_array()) {
-        auto shadingMapArray = j["lensShadingMap"];
+        const auto& shadingMapArray = j["lensShadingMap"];
         frame.lensShadingMap.reserve(shadingMapArray.size()); // Should be 4 channels
 
         for (const auto& channel : shadingMapArray) {
@@ -39,12 +41,12 @@ CameraFrameMetadata CameraFrameMetadata::parse(const json& j) {
             for (const auto& value : channel)
                 channelData1D.push_back(value.get<float>());
 
-            frame.lensShadingMap.emplace_back(channelData1D);
+            frame.lensShadingMap.emplace_back(std::move(channelData1D));
         }
     }
 
     if (j.contains("noiseProfile") && j["noiseProfile"].is_array()) {
-        auto noiseArray = j["noiseProfile"];
+        const auto& noiseArray = j["noiseProfile"];
         frame.noiseProfile.reserve(noiseArray.size());
         for (const auto& value : noiseArray)
             frame.noiseProfile.push_back(value.get<double>());

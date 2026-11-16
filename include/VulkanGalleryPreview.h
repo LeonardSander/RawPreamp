@@ -18,6 +18,8 @@ struct VulkanGalleryBayerGainMap {
 };
 struct VulkanGalleryBayerGain {
     uint32_t sourceWidth = 0, sourceHeight = 0, sourceScale = 1;
+    // Original-sensor offset for odd Bayer coordinates after composed reductions.
+    uint32_t sourceParityOffset = 1;
     std::vector<VulkanGalleryBayerGainMap> maps;
     std::array<float, 4> black{}, scale{};
     std::array<uint8_t, 4> phase{0, 1, 1, 2};

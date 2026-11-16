@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include "VulkanResidentImage.h"
 
 namespace rawpreamp {
 
@@ -18,23 +19,16 @@ struct VulkanJpegTile {
 };
 struct VulkanJpegContiguousSource;
 
-// Decode independent one- or three-component lossless JPEG tiles. This variant
+// Decode independent one- or three-channel lossless JPEG tiles. CFA tiles
+// may also use paired JPEG components with independent Huffman tables. This variant
 // reads pixels back to the CPU and is used for suitable tiled DNG imports. The
 // resident variant below can feed Vulkan processing without that copy.
 bool jpegDecodeTilesVulkan(const std::vector<VulkanJpegTile>& tiles,
                            std::vector<std::vector<uint16_t>>& pixels,
                            const VulkanJpegContiguousSource* contiguous = nullptr);
 
-struct VulkanDecodedJpegImage {
-    const void* gpu = nullptr;
-    const void* buffer = nullptr;
-    // GPU word containing 1 only if every tile decoded successfully. Pass it
-    // to the terminal JPEG encoder for validation at the final readback.
-    const void* validationBuffer = nullptr;
-    uint32_t width = 0, height = 0, channels = 0, bits = 0, wordsPerRow = 0;
-    // Optional ownership transferred from the decoder for deferred consumers.
-    std::shared_ptr<void> lease;
-};
+using VulkanDecodedJpegImage = VulkanResidentImage;
+
 struct VulkanJpegContiguousSource {
     const uint8_t* bytes = nullptr;
     size_t size = 0;
@@ -54,6 +48,8 @@ bool jpegDecodeTiledImageVulkan(
     const VulkanJpegContiguousSource* contiguous = nullptr);
 // Retains the assembled allocation without copying pixels. Reads only the
 // validation word before returning; deferred consumers own the output lease.
+// Preview decoding may share wider Huffman tables for throughput. Streaming
+// consumers above retain the shorter setup path.
 bool jpegDecodeTiledImageVulkanRetained(
     const std::vector<VulkanJpegTile>& tiles, uint32_t width, uint32_t height,
     uint32_t tileWidth, uint32_t tileHeight, VulkanDecodedJpegImage& image,
@@ -82,7 +78,8 @@ bool jpegDecodeResidentTiledImageVulkan(
     uint32_t width, uint32_t height, uint32_t channels,
     uint32_t tileWidth, uint32_t tileHeight, uint32_t tileCount,
     uint32_t slotWords,
-    const std::function<bool(const VulkanDecodedJpegImage&)>& consume);
+    const std::function<bool(const VulkanDecodedJpegImage&)>& consume,
+    uint32_t bits = 16);
 void releaseVulkanJpegDecodeDevice(const void* gpu);
 
 } // namespace rawpreamp

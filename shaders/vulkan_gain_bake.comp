@@ -21,7 +21,14 @@ layout(std430, binding = 1) readonly buffer GainMap {
     float gains[];
 } gainMap;
 #endif
+#ifdef SPATIAL_GAIN_BUILD
+layout(std430, binding = 2) writeonly buffer Destination { float values[]; } dst;
+#else
 layout(std430, binding = 2) writeonly buffer Destination { uint words[]; } dst;
+#endif
+#ifdef SPATIAL_GAIN_USE
+layout(std430, binding = 4) readonly buffer SpatialGain { float values[]; } spatialGain;
+#endif
 layout(std430, binding = 3) readonly buffer Linearization { uint values[]; } linearization;
 layout(push_constant) uniform Constants {
     vec4 black;
@@ -44,7 +51,7 @@ float mapValue(uint x, uint y, uint channel) {
                  (p.mapShape.z == 1u ? 0u : channel);
     return gainMap.gains[index];
 }
-float gainAt(uint x, uint y, uint channel) {
+float uncachedGainAt(uint x, uint y, uint channel) {
     if (x < gainMap.bounds.x || y < gainMap.bounds.y ||
         x >= gainMap.bounds.z || y >= gainMap.bounds.w) return 1.0;
     vec2 normalized = (vec2(x, y) + vec2(0.5)) / vec2(p.dimensions.xy);
@@ -64,7 +71,7 @@ vec3 mapRgb(uint x, uint y) {
     return vec3(gainMap.gains[index], gainMap.gains[index + 1u],
                 gainMap.gains[index + 2u]);
 }
-vec3 gainRgb(uint x, uint y) {
+vec3 uncachedGainRgb(uint x, uint y) {
     if (x < gainMap.bounds.x || y < gainMap.bounds.y ||
         x >= gainMap.bounds.z || y >= gainMap.bounds.w) return vec3(1.0);
     vec2 normalized = (vec2(x, y) + vec2(0.5)) / vec2(p.dimensions.xy);
@@ -80,15 +87,30 @@ vec3 gainRgb(uint x, uint y) {
                 !isnan(gain.z) && !isinf(gain.z) && gain.z > 0.0 ? gain.z : 1.0);
 }
 #else
-float gainAt(uint x, uint y, uint channel) {
+float uncachedGainAt(uint x, uint y, uint channel) {
     return multiGainAt(x, y, channel, true);
 }
-vec3 gainRgb(uint x, uint y) {
+vec3 uncachedGainRgb(uint x, uint y) {
     return vec3(multiGainAt(x, y, 0u, true),
                 multiGainAt(x, y, 1u, true),
                 multiGainAt(x, y, 2u, true));
 }
 #endif
+float gainAt(uint x, uint y, uint channel) {
+#ifdef SPATIAL_GAIN_USE
+    return spatialGain.values[(y * p.dimensions.x + x) * 3u + channel];
+#else
+    return uncachedGainAt(x, y, channel);
+#endif
+}
+vec3 gainRgb(uint x, uint y) {
+#ifdef SPATIAL_GAIN_USE
+    uint first = (y * p.dimensions.x + x) * 3u;
+    return vec3(spatialGain.values[first], spatialGain.values[first + 1u], spatialGain.values[first + 2u]);
+#else
+    return uncachedGainRgb(x, y);
+#endif
+}
 // @GAIN_COMMON@
 uint inputSample(uint index) {
 #ifdef SOURCE_TEXTURE
@@ -100,32 +122,6 @@ uint inputSample(uint index) {
 #else
     return packedInputSample(index);
 #endif
-}
-uint codeAt(uint y, uint rowSample) {
-    uint channel = rowSample % 3u;
-    uint x = rowSample / 3u;
-    uint index = y * (p.dimensions.x * 3u) + rowSample;
-    uint inputCode = inputSample(index);
-    float gain = gainAt(x, y, channel);
-    float value;
-    if ((p.flags & 4u) != 0u) {
-        value = gain > 0.0 ? p.destinationWhite / gain : 0.0;
-    } else {
-        value = p.destinationBlack[channel] +
-                gain * (float(inputCode) - p.black[channel]) * p.scale[channel];
-        if ((p.flags & 1u) != 0u) {
-            float linear = floor(clamp(value, 0.0, 65535.0) + 0.5);
-            float normalized = clamp((linear - p.destinationBlack.x) /
-                max(1.0, p.destinationWhite - p.destinationBlack.x), 0.0, 1.0);
-            value = ((p.flags & 32u) != 0u
-                ? uintBitsToFloat(linearization.values[uint(linear)])
-                : ((p.flags & 64u) != 0u ? rawpreampLLog60(normalized, p.encodedWhite)
-                    : rawpreampLog60(normalized, p.encodedWhite))) + ditherAt(x, y);
-        }
-    }
-    float maximum = (p.flags & 1u) != 0u ? float(p.encodedWhite)
-        : float((1u << p.dimensions.w) - 1u);
-    return uint(floor(clamp(value, 0.0, maximum) + 0.5));
 }
 float sourceCode(uint index) {
     return float(inputSample(index));
@@ -163,7 +159,19 @@ uvec3 pixelCodes(uint x, uint y) {
         : float((1u << p.dimensions.w) - 1u);
     return uvec3(floor(clamp(value, 0.0, maximum) + 0.5));
 }
+uint codeAt(uint y, uint rowSample) {
+    return pixelCodes(rowSample / 3u, y)[rowSample % 3u];
+}
 void main() {
+#ifdef SPATIAL_GAIN_BUILD
+    uint index = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (index >= p.dimensions.x * p.dimensions.y) return;
+    uint x = index % p.dimensions.x, y = index / p.dimensions.x;
+    vec3 value = uncachedGainRgb(x, y);
+    dst.values[index * 3u] = value.r;
+    dst.values[index * 3u + 1u] = value.g;
+    dst.values[index * 3u + 2u] = value.b;
+#else
     uint wordInRow = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
     if (y >= p.dimensions.y) return;
@@ -198,19 +206,37 @@ void main() {
         dst.words[wordIndex] = a | (b << 16);
         return;
     }
+    if (p.dimensions.w == 12u) {
+        uint group = wordInRow / 3u * 8u;
+        uint phase = wordInRow % 3u;
+        uint first = group + (phase == 0u ? 0u : phase == 1u ? 2u : 5u);
+        uint a = first < rowSamples ? codeAt(y, first) : 0u;
+        uint b = first + 1u < rowSamples ? codeAt(y, first + 1u) : 0u;
+        uint c = first + 2u < rowSamples ? codeAt(y, first + 2u) : 0u;
+        uint packed;
+        if (phase == 0u) packed = (a << 20u) | (b << 8u) | (c >> 4u);
+        else if (phase == 1u) {
+            uint d = first + 3u < rowSamples ? codeAt(y, first + 3u) : 0u;
+            packed = (a << 28u) | (b << 16u) | (c << 4u) | (d >> 8u);
+        } else packed = (a << 24u) | (b << 12u) | c;
+        dst.words[wordIndex] = swapWordBytes(packed);
+        return;
+    }
     uint bitStart = wordInRow * 32u;
     uint first = bitStart / p.dimensions.w;
     uint last = min(rowSamples, (bitStart + 31u) / p.dimensions.w + 1u);
     uint packed = 0u;
-    for (uint sampleIndex = first; sampleIndex < last; ++sampleIndex) {
-        uint code = codeAt(y, sampleIndex);
-        uint sampleBitStart = sampleIndex * p.dimensions.w;
-        int shift = int(32u - p.dimensions.w) -
-                    int(sampleBitStart - bitStart);
-        if (shift >= 0)
-            packed |= code << uint(shift);
-        else
-            packed |= code >> uint(-shift);
+    for (uint pixel = first / 3u; pixel < (last + 2u) / 3u; ++pixel) {
+        uvec3 codes = pixelCodes(pixel, y);
+        for (uint sampleIndex = max(first, pixel * 3u);
+             sampleIndex < min(last, pixel * 3u + 3u); ++sampleIndex) {
+            uint code = codes[sampleIndex % 3u];
+            uint sampleBitStart = sampleIndex * p.dimensions.w;
+            int shift = int(32u - p.dimensions.w) - int(sampleBitStart - bitStart);
+            if (shift >= 0) packed |= code << uint(shift);
+            else packed |= code >> uint(-shift);
+        }
     }
     dst.words[wordIndex] = swapWordBytes(packed);
+#endif
 }

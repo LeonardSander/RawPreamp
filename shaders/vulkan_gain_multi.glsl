@@ -36,12 +36,10 @@ float multiGainAt(uint x, uint y, uint channel, bool rgb) {
              (x - bounds.x) % pitch.y != 0u))
             continue;
         vec4 axes = gainMaps.axes[mapIndex];
-        vec2 normalized = (vec2(x, y) + vec2(0.5)) / vec2(p.dimensions.xy);
-        vec2 grid = (normalized - axes.xy) / axes.zw;
-        vec2 base = floor(grid);
-        vec2 fraction = clamp(grid - base, 0.0, 1.0);
-        uvec2 a = uvec2(clamp(base, vec2(0), vec2(shape.xy - uvec2(1))));
-        uvec2 b = min(a + uvec2(1), shape.xy - uvec2(1));
+        uvec2 a, b;
+        vec2 fraction;
+        rawpreampGainGrid(uvec2(x, y), p.dimensions.xy, shape.xy, axes,
+                         a, b, fraction);
         float upper = mix(multiMapValue(mapIndex, a, channel, rgb),
                           multiMapValue(mapIndex, uvec2(b.x, a.y), channel, rgb),
                           fraction.x);

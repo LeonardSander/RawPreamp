@@ -246,6 +246,52 @@ static bool ifdsAreTagSorted(const std::vector<uint8_t>& dng) {
 }
 
 static int benchmarkRealJpegDng(const char* path) {
+    if (const char* output = std::getenv("RAWPREAMP_TEST_RETILE_DNG_OUTPUT")) {
+        std::vector<std::filesystem::path> sources;
+        for (const auto& entry : std::filesystem::directory_iterator(path))
+            if (entry.path().extension() == ".dng") sources.push_back(entry.path());
+        std::sort(sources.begin(), sources.end());
+        std::filesystem::create_directories(output);
+        for (size_t i = 0; i < std::min<size_t>(sources.size(), 60); ++i) {
+            std::ifstream input(sources[i], std::ios::binary);
+            std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
+            if (!rawpreamp::DNGDecoder::ensureUncompressed(bytes)) return 6;
+            if (const char* setting = std::getenv("RAWPREAMP_TEST_RETILE_TILE_SIDE")) {
+                const uint32_t side = std::strtoul(setting, nullptr, 10);
+                rawpreamp::DecodedDNGImage image;
+                if (!side || !rawpreamp::DNGDecoder::decodeImage(bytes, image)) return 6;
+                const uint32_t width = image.layout.width, height = image.layout.height;
+                const uint32_t channels = image.layout.samplesPerPixel;
+                if (width % side || height % side) return 6;
+                const uint32_t across = width / side, count = across * (height / side);
+                std::vector<std::vector<uint8_t>> tiles(count);
+                std::atomic_uint32_t next{0}; std::atomic_bool failed{false};
+                auto encode = [&] {
+                    std::vector<uint16_t> samples(size_t(side) * side * channels);
+                    for (uint32_t t; (t = next.fetch_add(1)) < count;) {
+                        for (uint32_t y = 0; y < side; ++y)
+                            std::copy_n(image.samples.data() +
+                                (size_t((t / across) * side + y) * width + (t % across) * side) * channels,
+                                size_t(side) * channels, samples.data() + size_t(y) * side * channels);
+                        uint8_t* encoded = nullptr; int length = 0;
+                        if (lj92_encode(samples.data(), side, side, image.layout.bitsPerSample,
+                            channels, side * channels, 0, nullptr, 0, &encoded, &length) != LJ92_ERROR_NONE) failed = true;
+                        else tiles[t].assign(encoded, encoded + length);
+                        free(encoded);
+                    }
+                };
+                std::vector<std::thread> workers;
+                for (int w = 0; w < 7; ++w) workers.emplace_back(encode);
+                encode(); for (auto& worker : workers) worker.join();
+                if (failed || !rawpreamp::DNGDecoder::attachLosslessJPEGTiles(bytes, tiles, side, side)) return 6;
+            } else if (!rawpreamp::DNGDecoder::compressLosslessJPEGTiled(bytes)) return 6;
+            std::ofstream file(std::filesystem::path(output) / sources[i].filename(), std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            if (!file) return 6;
+        }
+        std::fprintf(stderr, "Retiled %zu source DNG frames into %s\n", std::min<size_t>(sources.size(), 60), output);
+        return 0;
+    }
     std::ifstream file(path, std::ios::binary);
     if (!file) return 2;
     const std::vector<uint8_t> dng((std::istreambuf_iterator<char>(file)),
@@ -272,6 +318,79 @@ static int benchmarkRealJpegDng(const char* path) {
     };
     const uint32_t width = tag(256), height = tag(257), bits = tag(258);
     const uint32_t compression = tag(259), channels = tag(277);
+    if (const uint32_t tileWidth = tag(322)) {
+        const uint32_t tileHeight = tag(323);
+        auto array = [&](uint16_t wanted) {
+            std::vector<uint32_t> values;
+            for (uint32_t i = 0; i < entries; ++i) {
+                const size_t at = ifd + 2u + i * 12u;
+                if (u16(at) != wanted || u16(at + 2u) != 4u) continue;
+                const uint32_t count = u32(at + 4u), offset = u32(at + 8u);
+                if (count == 1) values.push_back(offset);
+                else if (offset <= dng.size() && count <= (dng.size() - offset) / 4u)
+                    for (uint32_t j = 0; j < count; ++j) values.push_back(u32(offset + j * 4u));
+            }
+            return values;
+        };
+        const auto offsets = array(324), lengths = array(325);
+        if (!tileHeight || !width || !height || compression != 7u ||
+            width % tileWidth || height % tileHeight || offsets.size() != lengths.size() ||
+            offsets.size() != size_t(width / tileWidth) * (height / tileHeight)) return 3;
+        std::vector<rawpreamp::VulkanJpegTile> tiles;
+        std::vector<std::vector<uint16_t>> expected;
+        std::vector<uint16_t> assembled(size_t(width) * height * channels);
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            if (offsets[i] > dng.size() || lengths[i] > dng.size() - offsets[i]) return 3;
+            auto* data = const_cast<uint8_t*>(dng.data() + offsets[i]);
+            lj92 decoder = nullptr;
+            int w = 0, h = 0, b = 0, c = 0;
+            if (lj92_open(&decoder, data, lengths[i], &w, &h, &b, &c) != LJ92_ERROR_NONE) return 4;
+            expected.emplace_back(size_t(tileWidth) * tileHeight * channels);
+            const bool ok = w * c == int(tileWidth * channels) && h == int(tileHeight) && b == int(bits) &&
+                lj92_decode(decoder, expected.back().data(), tileWidth * channels, 0, nullptr, 0) == LJ92_ERROR_NONE;
+            lj92_close(decoder);
+            if (!ok) return 4;
+            tiles.push_back({data, lengths[i], tileWidth, tileHeight, bits, channels});
+            const uint32_t tx = (i % (width / tileWidth)) * tileWidth;
+            const uint32_t ty = (i / (width / tileWidth)) * tileHeight;
+            for (uint32_t y = 0; y < tileHeight; ++y)
+                std::memcpy(assembled.data() + (size_t(ty + y) * width + tx) * channels,
+                    expected.back().data() + size_t(y) * tileWidth * channels,
+                    size_t(tileWidth) * channels * sizeof(uint16_t));
+        }
+        const rawpreamp::VulkanJpegContiguousSource contiguous{dng.data(), dng.size()};
+        for (bool gpuParse : {false, true}) {
+            std::vector<std::vector<uint16_t>> decoded;
+            if (!rawpreamp::jpegDecodeTilesVulkan(tiles, decoded, gpuParse ? &contiguous : nullptr) ||
+                decoded != expected) return 5;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                rawpreamp::VulkanDecodedJpegImage resident;
+                const auto start = std::chrono::steady_clock::now();
+                if (!rawpreamp::jpegDecodeTiledImageVulkanRetained(tiles, width, height,
+                    tileWidth, tileHeight, resident, gpuParse ? &contiguous : nullptr)) return 5;
+                const auto end = std::chrono::steady_clock::now();
+                std::vector<uint16_t> actual(assembled.size());
+                if (!rawpreamp::downloadVulkanDecodedJpegImage(resident, actual.data(), actual.size()) ||
+                    actual != assembled) return 5;
+                std::fprintf(stderr, "Real tiled DNG resident decode: %ux%u tiles=%zu gpu_parse=%d attempt=%d ms=%.3f equal=1\n",
+                    width, height, tiles.size(), gpuParse, attempt,
+                    std::chrono::duration<double, std::milli>(end - start).count());
+            }
+        }
+        auto invalid = std::vector<uint8_t>(tiles.front().bytes,
+            tiles.front().bytes + tiles.front().size);
+        for (size_t i = 0; i + 1 < invalid.size(); ++i) {
+            if (invalid[i] != 255 || invalid[i + 1] != 0) continue;
+            invalid[i + 1] = 1; // Unescaped marker inside entropy data.
+            auto tile = tiles.front(); tile.bytes = invalid.data();
+            const rawpreamp::VulkanJpegContiguousSource source{invalid.data(), invalid.size()};
+            std::vector<std::vector<uint16_t>> decoded;
+            if (rawpreamp::jpegDecodeTilesVulkan({tile}, decoded) ||
+                rawpreamp::jpegDecodeTilesVulkan({tile}, decoded, &source)) return 5;
+            break;
+        }
+        return 0;
+    }
     const uint32_t offset = tag(273), size = tag(279);
     if (!width || !height || !size || compression != 7u ||
         (channels != 1u && channels != 3u) ||
@@ -324,7 +443,257 @@ static int benchmarkRealJpegDng(const char* path) {
     return 0;
 }
 
+void testMcrawVulkan();
+void testRawDecodeVulkan();
+
+// Narrow entry point for entropy/predictor tuning: no gallery or container
+// matrix, but includes paired CFA, RGB, partial workgroups and malformed input.
+static int testJpegDecodeFocused() {
+    for (uint32_t components : {1u, 2u, 3u})
+        for (uint32_t tileWidth : {8u, 16u, 32u, 64u})
+            for (uint32_t bits : {12u, 16u}) {
+                constexpr uint32_t count = 5, height = 17;
+                const uint32_t channels = components == 3u ? 3u : 1u;
+                const uint32_t rowSamples = tileWidth * channels;
+                std::vector<std::vector<uint16_t>> source(count);
+                std::vector<std::vector<uint8_t>> encoded(count);
+                std::vector<rawpreamp::VulkanJpegTile> tiles(count);
+                std::vector<uint16_t> expected(size_t(rowSamples) * count * height);
+                for (uint32_t tile = 0; tile < count; ++tile) {
+                    source[tile].resize(size_t(rowSamples) * height);
+                    for (size_t i = 0; i < source[tile].size(); ++i)
+                        source[tile][i] = uint16_t((i * 197u + i / 7u * 73u + tile * 931u) & ((1u << bits) - 1u));
+                    uint8_t* bytes = nullptr; int size = 0;
+                    // Paired-CFA cases also mix ordinary CFA tiles in the same
+                    // image to cover per-tile component layout changes.
+                    const uint32_t encodedComponents = components == 2u && (tile & 1u) ? 1u : components;
+                    assert(lj92_encode(source[tile].data(), encodedComponents == 2u ? tileWidth / 2u : tileWidth,
+                        height, bits, encodedComponents, rowSamples, 0, nullptr, 0, &bytes, &size) == LJ92_ERROR_NONE);
+                    encoded[tile].assign(bytes, bytes + size);
+                    free(bytes);
+                    tiles[tile] = {encoded[tile].data(), encoded[tile].size(), tileWidth, height, bits, channels};
+                    for (uint32_t y = 0; y < height; ++y)
+                        std::copy_n(source[tile].data() + y * rowSamples, rowSamples,
+                            expected.data() + size_t(y) * rowSamples * count + tile * rowSamples);
+                }
+                // A malformed first tile must reject the frame even when later
+                // tiles share its Huffman tables and have otherwise valid JPEGs.
+                std::vector<uint8_t> badOwner;
+                std::vector<rawpreamp::VulkanJpegTile> ownerTiles(count);
+                for (uint32_t tile = 0; tile < count; ++tile)
+                    badOwner.insert(badOwner.end(), encoded[0].begin(), encoded[0].end());
+                badOwner[0] = 0;
+                for (uint32_t tile = 0; tile < count; ++tile)
+                    ownerTiles[tile] = {badOwner.data() + tile * encoded[0].size(),
+                        encoded[0].size(), tileWidth, height, bits, channels};
+                const rawpreamp::VulkanJpegContiguousSource badOwnerSource{badOwner.data(), badOwner.size()};
+                rawpreamp::VulkanDecodedJpegImage ownerRejected;
+                assert(!rawpreamp::jpegDecodeTiledImageVulkanRetained(ownerTiles, tileWidth * count,
+                    height, tileWidth, height, ownerRejected, &badOwnerSource));
+                rawpreamp::VulkanDecodedJpegImage image;
+                assert(rawpreamp::jpegDecodeTiledImageVulkanRetained(tiles, tileWidth * count,
+                    height, tileWidth, height, image));
+                std::vector<uint16_t> actual(expected.size());
+                assert(rawpreamp::downloadVulkanDecodedJpegImage(image, actual.data(), actual.size()));
+                assert(actual == expected);
+                // Exercise the production GPU header parser and unaligned
+                // source windows as well as the CPU-parsed tile path.
+                std::vector<uint8_t> contiguous;
+                std::array<size_t, count> offsets{};
+                for (uint32_t tile = 0; tile < count; ++tile) {
+                    while ((contiguous.size() & 3u) != (tile & 3u)) contiguous.push_back(0);
+                    offsets[tile] = contiguous.size();
+                    contiguous.insert(contiguous.end(), encoded[tile].begin(), encoded[tile].end());
+                }
+                for (uint32_t tile = 0; tile < count; ++tile)
+                    tiles[tile].bytes = contiguous.data() + offsets[tile];
+                const rawpreamp::VulkanJpegContiguousSource contiguousSource{
+                    contiguous.data(), contiguous.size()};
+                assert(rawpreamp::jpegDecodeTiledImageVulkanRetained(tiles, tileWidth * count,
+                    height, tileWidth, height, image, &contiguousSource));
+                assert(rawpreamp::downloadVulkanDecodedJpegImage(image, actual.data(), actual.size()));
+                assert(actual == expected);
+                // Reject bad stuffing inside decoded samples and in surplus
+                // entropy bytes after the final sample.
+                size_t scan = 2;
+                while (encoded[2][scan + 1u] != 0xdau) {
+                    const size_t length = (size_t(encoded[2][scan + 2u]) << 8u) |
+                                          encoded[2][scan + 3u];
+                    scan += 2u + length;
+                    assert(scan + 4u < encoded[2].size());
+                }
+                scan += 2u + (size_t(encoded[2][scan + 2u]) << 8u) + encoded[2][scan + 3u];
+                for (bool trailing : {false, true}) {
+                    auto bad = encoded[2];
+                    if (trailing) bad.insert(bad.end() - 2, {255u, 1u});
+                    else { bad[scan] = 255u; bad[scan + 1u] = 1u; }
+                    const rawpreamp::VulkanJpegContiguousSource badSource{bad.data(), bad.size()};
+                    const rawpreamp::VulkanJpegTile badTile{bad.data(), bad.size(), tileWidth, height, bits, channels};
+                    rawpreamp::VulkanDecodedJpegImage rejected;
+                    assert(!rawpreamp::jpegDecodeTiledImageVulkanRetained({badTile}, tileWidth,
+                        height, tileWidth, height, rejected, &badSource));
+                }
+                tiles[2].size -= 2;
+                rawpreamp::VulkanDecodedJpegImage invalid;
+                assert(!rawpreamp::jpegDecodeTiledImageVulkanRetained(tiles, tileWidth * count,
+                    height, tileWidth, height, invalid, &contiguousSource));
+                // End with a released successful image, so shutdown also covers
+                // cached passes without an outstanding decoded-image lease.
+                tiles[2].size += 2;
+                assert(rawpreamp::jpegDecodeTiledImageVulkanRetained(tiles, tileWidth * count,
+                    height, tileWidth, height, image, &contiguousSource));
+                assert(rawpreamp::downloadVulkanDecodedJpegImage(image, actual.data(), actual.size()));
+                assert(actual == expected);
+#ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
+                if (components == 3u && tileWidth == 8u && bits == 16u) {
+                    // A one-pixel RGB tile has less entropy than the header's
+                    // alignment padding. Assembly must not read past its body.
+                    const uint32_t packed[] = {0x80008000u, 0x00008000u,
+                                               0x80018001u, 0x00008001u};
+                    pl_buf_params params{};
+                    params.size = sizeof(packed);
+                    params.storable = true;
+                    params.initial_data = packed;
+                    const auto gpu = static_cast<pl_gpu>(image.gpu);
+                    pl_buf buffer = pl_buf_create(gpu, &params);
+                    assert(buffer);
+                    std::vector<std::vector<uint8_t>> output;
+                    const bool encoded = rawpreamp::jpegEncodeTiledVulkanPackedBuffer(
+                        gpu, buffer, 1, 2, 3, 16, 2, 1, 1, output);
+                    pl_buf_destroy(gpu, &buffer);
+                    assert(encoded && output.size() == 2);
+                    for (size_t tile = 0; tile < output.size(); ++tile) {
+                        lj92 decoder = nullptr;
+                        int w = 0, h = 0, b = 0, c = 0;
+                        assert(lj92_open(&decoder, output[tile].data(), int(output[tile].size()),
+                            &w, &h, &b, &c) == LJ92_ERROR_NONE);
+                        assert(w == 1 && h == 1 && b == 16 && c == 3);
+                        uint16_t decoded[3]{};
+                        assert(lj92_decode(decoder, decoded, 3, 0, nullptr, 0) == LJ92_ERROR_NONE);
+                        lj92_close(decoder);
+                        assert(decoded[0] == 32768 + tile && decoded[1] == 32768 + tile && decoded[2] == 32768 + tile);
+                    }
+                }
+#endif
+            }
+    std::fprintf(stderr, "Focused Vulkan JPEG decode: 24 fixtures passed (CPU/GPU header parsing)\n");
+    return 0;
+}
+
+static int testGainFieldFocused() {
+    const std::array<float, 3> gains{1,1,1};
+    const std::array<float, 9> identity{1,0,0,0,1,0,0,0,1};
+    unsigned fixture = 0;
+    for (const auto& phase : {std::array<uint8_t,4>{0,1,1,2}, {2,1,1,0}, {1,0,2,1}, {1,2,0,1}})
+        for (uint32_t channels : {1u,3u,4u}) {
+            rawpreamp::VulkanGalleryBayerGain gain;
+            gain.phase = phase; gain.scale.fill(1.1f); gain.black.fill(100);
+            rawpreamp::VulkanGalleryBayerGainMap map;
+            map.width = 3; map.height = 2; map.channels = channels;
+            map.spacingH = 0.4f; map.spacingV = 0.6f;
+            map.originH = 0.15f; map.originV = 0.11f;
+            map.rowPitch = channels == 1 ? 2 : 1;
+            map.colPitch = channels == 1 ? 2 : 1;
+            map.values.resize(6u * channels);
+            for (size_t i = 0; i < map.values.size(); ++i) map.values[i] = 0.7f + float(i % 7) * 0.13f;
+            gain.maps = {map};
+            map.channels = 1; map.width = 2; map.height = 3;
+            map.rowPitch = map.colPitch = 1;
+            map.values = {0.9f,1.1f,1.2f,0.8f,1.3f,1.0f};
+            gain.maps.push_back(map);
+            std::vector<uint16_t> samples(32u * 18u);
+            for (size_t i = 0; i < samples.size(); ++i) samples[i] = uint16_t(2000 + i * 97u % 32000);
+            for (unsigned step = 0; step < 6; ++step, ++fixture) {
+                rawpreamp::VulkanGalleryBayerSource source;
+                source.samples = samples.data(); source.gain = &gain; source.phase = phase;
+                source.width = step == 5 ? 18 : 32; source.height = step == 5 ? 14 : 18;
+                source.white.fill(65535);
+                gain.sourceScale = step >= 4 ? 2 : 1;
+                gain.sourceWidth = source.width * gain.sourceScale;
+                gain.sourceHeight = source.height * gain.sourceScale;
+                gain.encodedWhite = step == 0 ? 0 : 4095;
+                gain.ditherSeed = 17u + step;
+                gain.highQualityDither = step % 2;
+                gain.black.fill(100.0f + float(step));
+                if (step == 2) gain.maps[0].values[0] += 0.3f;
+                if (step == 3) gain.maps[0].originH += 0.1f;
+                for (auto& current : gain.maps) {
+                    current.right = gain.sourceWidth - 1;
+                    current.bottom = gain.sourceHeight - 1;
+                }
+                std::vector<uint8_t> output;
+                assert(rawpreamp::colorGalleryRgbVulkan(output, gains, identity, identity,
+                    1, nullptr, nullptr, false, false, &source));
+                assert(output.size() == size_t(source.width) * source.height * 6u);
+                if (const char* prefix = std::getenv("RAWPREAMP_GAIN_FIELD_CAPTURE")) {
+                    std::ofstream file(std::string(prefix) + "-" + std::to_string(fixture) + ".bin", std::ios::binary);
+                    file.write(reinterpret_cast<const char*>(output.data()), output.size());
+                    assert(file.good());
+                }
+            }
+        }
+    std::fprintf(stderr, "Focused gain field: %u changing-input fixtures passed\n", fixture);
+    return 0;
+}
+
+static int testCpuSpatialGainFocused() {
+    unsigned cases = 0;
+    for (uint32_t channels : {1u,3u}) for (uint32_t planes : {1u,3u}) {
+        if (channels == 1u && planes == 3u) continue;
+        for (unsigned change = 0; change < 3; ++change, ++cases) {
+            const uint32_t width = change == 2 ? 18u : 32u, height = 14;
+            std::vector<uint16_t> pixels(size_t(width) * height * channels);
+            for (size_t i=0;i<pixels.size();++i) pixels[i] = uint16_t(1000 + (i*79u)%32000u);
+            tinydngwriter::DNGImage image;
+            image.SetBigEndian(false);
+            const unsigned short bits[] = {16,16,16};
+            assert(image.SetImageWidth(width) && image.SetImageLength(height));
+            assert(image.SetRowsPerStrip(height) && image.SetSamplesPerPixel(channels));
+            assert(image.SetBitsPerSample(channels,bits));
+            assert(image.SetCompression(tinydngwriter::COMPRESSION_NONE));
+            assert(image.SetPhotometric(channels == 1 ? tinydngwriter::PHOTOMETRIC_CFA : tinydngwriter::PHOTOMETRIC_LINEARRAW));
+            assert(image.SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG));
+            assert(image.SetWhiteLevel(65535));
+            assert(image.SetImageData(reinterpret_cast<const unsigned char*>(pixels.data()),pixels.size()*2u));
+            tinydngwriter::GainMapParams map{};
+            map.right=width; map.bottom=height; map.planes=channels;
+            map.row_pitch=map.col_pitch=1;
+            map.map_points_h=3; map.map_points_v=2; map.map_planes=planes;
+            map.map_spacing_h=0.4; map.map_spacing_v=0.6;
+            map.gain_data.resize(6u*planes);
+            for(size_t i=0;i<map.gain_data.size();++i) map.gain_data[i]=0.8f+float(i%5)*0.13f+float(change)*0.01f;
+            tinydngwriter::OpcodeList opcodes; opcodes.AddGainMap(map);
+            assert(image.SetOpcodeList2(opcodes));
+            tinydngwriter::DNGWriter writer(false); assert(writer.AddImage(&image));
+            std::ostringstream out(std::ios::binary); std::string error;
+            assert(writer.WriteToFile(out,&error));
+            const auto encoded=out.str();
+            std::vector<uint16_t> expected;
+            for(unsigned frame=0;frame<3;++frame) {
+                std::vector<uint8_t> bytes(encoded.begin(),encoded.end());
+                assert(rawpreamp::DNGDecoder::bakeGainMaps(bytes,false,false,false,false,2,
+                    std::array<uint8_t,4>{0,1,1,2}));
+                rawpreamp::DecodedDNGImage decoded;
+                assert(rawpreamp::DNGDecoder::decodeImage(bytes,decoded));
+                if(frame==0) expected=decoded.samples;
+                else assert(decoded.samples==expected);
+            }
+        }
+    }
+    std::fprintf(stderr,"General CPU spatial gains: %u cold/build/reuse cases passed\n",cases);
+    return 0;
+}
+
 int main() {
+    if (std::getenv("RAWPREAMP_TEST_RAW_DECODE_ONLY")) {
+        testRawDecodeVulkan();
+        return 0;
+    }
+    if (std::getenv("RAWPREAMP_CPU_SPATIAL_GAIN_TEST")) return testCpuSpatialGainFocused();
+    if (std::getenv("RAWPREAMP_GAIN_FIELD_FOCUSED_TEST")) return testGainFieldFocused();
+    if (std::getenv("RAWPREAMP_JPEG_DECODE_FOCUSED_TEST")) return testJpegDecodeFocused();
+    testMcrawVulkan();
+    if (std::getenv("RAWPREAMP_TEST_MCRAW_ONLY")) return 0;
     // Adapting a common GPU image to vector readback must keep its lease.
     {
         auto owner = std::make_shared<int>(7);
@@ -1913,9 +2282,9 @@ int main() {
     checkGpuPackedJpeg(1024, 512, 3, true, 4095,
                        rawpreamp::LogTransformMode::Disabled, true, true);
 
-    // Independent lossless JPEG tiles exercise the Vulkan entropy and
-    // predictor decoder, including its tile placement and 16-bit wrapping.
-    {
+    // Both ordinary CFA JPEG and paired-component CFA JPEG exercise entropy,
+    // predictor reconstruction, tile placement and 16-bit wrapping.
+    for (uint32_t jpegComponents : {1u, 2u}) {
         const bool smallTiles = std::getenv("RAWPREAMP_JPEG_DECODE_SMALL_TILES");
         const uint32_t tileWidth = smallTiles ? 32u : 128u;
         const uint32_t tileHeight = tileWidth;
@@ -1935,8 +2304,9 @@ int main() {
                                       ((1u << bits) - 1u));
             uint8_t* bytes = nullptr;
             int count = 0;
-            assert(lj92_encode(samples.data(), tileWidth, tileHeight, bits, 1,
-                               tileWidth, 0, nullptr, 0, &bytes, &count) == LJ92_ERROR_NONE);
+            assert(lj92_encode(samples.data(), tileWidth / jpegComponents, tileHeight, bits,
+                               jpegComponents, tileWidth, 0, nullptr, 0,
+                               &bytes, &count) == LJ92_ERROR_NONE);
             encoded[tile].assign(bytes, bytes + count);
             free(bytes);
             inputs[tile] = {encoded[tile].data(), encoded[tile].size(),
@@ -2548,6 +2918,75 @@ int main() {
         assert(textureColor == residentColor);
         assert(std::any_of(textureColor.begin(), textureColor.end(),
                            [](uint8_t value) { return value != 0; }));
+        // Exercise shared RGB gain coordinates, channel-specific normalization,
+        // secondary luminance, LOG quantization and both dither hashes. These
+        // captures also allow bit-exact A/B when changing the display shader.
+        rawpreamp::VulkanGalleryGain rgbGain;
+        rgbGain.width = 3; rgbGain.height = 2;
+        rgbGain.left = 7; rgbGain.top = 11;
+        rgbGain.right = width - 5; rgbGain.bottom = height - 9;
+        rgbGain.originH = 0.13f; rgbGain.originV = 0.17f;
+        rgbGain.spacingH = 0.31f; rgbGain.spacingV = 0.53f;
+        rgbGain.values = {0.8f,1.1f,1.3f, 1.4f,0.9f,1.2f, 1.7f,1.3f,0.7f,
+                          1.2f,1.5f,0.6f, 0.9f,1.8f,1.1f, 1.6f,0.8f,1.4f};
+        rgbGain.secondaryWidth = rgbGain.secondaryHeight = 2;
+        rgbGain.secondaryLeft = 13; rgbGain.secondaryTop = 17;
+        rgbGain.secondaryRight = width - 19; rgbGain.secondaryBottom = height - 23;
+        rgbGain.secondarySpacingH = 0.7f; rgbGain.secondarySpacingV = 0.6f;
+        rgbGain.secondaryValues = {0.8f, 1.4f, 1.1f, 1.7f};
+        rgbSource.gain = &rgbGain;
+        rgbSource.black = {123, 271, 409};
+        rgbSource.white = {60000, 57000, 62000};
+        for (unsigned fixture = 0; fixture < 6; ++fixture) {
+            rgbGain.encodedWhite = fixture == 0 ? 0 : fixture == 1 ? 1023 :
+                                   fixture == 5 ? 65535 : 4095;
+            rgbGain.highQualityDither = fixture >= 3;
+            rgbGain.debugGainMap = fixture == 4;
+            rgbGain.ditherSeed = 0x12345678u + fixture;
+            assert(rawpreamp::colorGalleryRgbVulkan(textureColor, gains, identity, identity,
+                1, nullptr, nullptr, false, false, nullptr, nullptr, &rgbSource));
+            assert(textureColor.size() == residentColor.size());
+            if (const char* prefix = std::getenv("RAWPREAMP_TEST_RGB_CAPTURE")) {
+                std::ofstream capture(std::string(prefix) + "-" +
+                    std::to_string(fixture) + ".bin", std::ios::binary);
+                capture.write(reinterpret_cast<const char*>(textureColor.data()),
+                              textureColor.size());
+                assert(capture.good());
+            }
+        }
+        // A neutral ramp must stay neutral with LOG dither. Vary the frame
+        // seed to prove dither is active, while requiring identical RGB codes
+        // at every pixel in both hash modes and at each supported LOG depth.
+        for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel)
+            for (unsigned channel = 0; channel < 3; ++channel)
+                rgba[pixel * 4u + channel] = uint16_t(pixel % 65536u);
+        assert(pl_tex_upload(gpu, &transfer));
+        rgbSource.black = {0, 0, 0}; rgbSource.white = {65535, 65535, 65535};
+        std::fill(rgbGain.values.begin(), rgbGain.values.end(), 1.0f);
+        rgbGain.secondaryValues.clear();
+        rgbGain.secondaryWidth = rgbGain.secondaryHeight = 0;
+        rgbGain.debugGainMap = false;
+        for (uint32_t white : {1023u, 4095u, 65535u}) {
+            rgbGain.encodedWhite = white;
+            for (bool hq : {false, true}) {
+                rgbGain.highQualityDither = hq;
+                std::vector<uint8_t> firstSeed;
+                for (uint32_t seed : {17u, 29u}) {
+                    rgbGain.ditherSeed = seed;
+                    assert(rawpreamp::colorGalleryRgbVulkan(textureColor, gains, identity,
+                        identity, 1, nullptr, nullptr, false, false, nullptr, nullptr, &rgbSource));
+                    assert(textureColor.size() == size_t(width) * height * 6u);
+                    for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
+                        uint16_t codes[3];
+                        std::memcpy(codes, textureColor.data() + pixel * 6u, sizeof(codes));
+                        assert(codes[0] == codes[1] && codes[1] == codes[2]);
+                    }
+                    if (seed == 17u) firstSeed = textureColor;
+                    else assert(textureColor != firstSeed);
+                }
+            }
+        }
+        rgbSource.gain = nullptr;
         pl_tex_destroy(gpu, &rgbTexture);
         for (uint32_t scale : {2u, 4u, 8u}) {
             rawpreamp::VulkanDecodedJpegImage reduced;
