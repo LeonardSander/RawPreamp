@@ -57,6 +57,7 @@ public:
     void setAndroidFinalizeDestination(const QString& mode,
                                        const QString& legacyCustomDirectory);
     QString getAndroidFinalizeDestination() const;
+    bool getAndroidDirectFileAccess() const;
 
     void setMatrixOverrideEnabled(bool enabled);
     bool getMatrixOverrideEnabled() const;
@@ -101,6 +102,9 @@ private:
     QLabel* mNativeVideoCacheUsageLabel;
     QPushButton* mClearNativeVideoCacheButton;
 #ifdef __ANDROID__
+    QCheckBox* mAndroidDirectFileAccessCheckBox;
+    bool mAndroidFileAccessPending = false;
+    bool mAndroidFileAccessLeftApp = false;
     QComboBox* mAndroidFinalizeDestinationCombo;
     QString mAndroidFinalizeDestination=QStringLiteral("documents");
     int rememberAndroidFinalizeDirectory(const QString& uri);

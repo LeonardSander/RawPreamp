@@ -6,6 +6,11 @@
 #include <vector>
 
 namespace rawpreamp {
+bool directFileAccessEnabled();
+void setDirectFileAccessEnabled(bool enabled);
+bool allFilesAccessGranted();
+void requestAllFilesAccess();
+QString directSourcePath(const QString& uri);
 // Folder exports return the created folder name; direct exports return a
 // collision-free basename shared by the video and sidecar files.
 QString prepareFinalizeOutput(const QString& folderName, const QString& mode,

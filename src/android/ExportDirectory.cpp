@@ -45,6 +45,26 @@ bool writeActivity(const char* methodName, const char* signature, Args... args) 
 
 }
 
+bool directFileAccessEnabled() {
+    const auto activity = QNativeInterface::QAndroidApplication::context();
+    return activity.isValid() && activity.callMethod<jboolean>("directFileAccessEnabled");
+}
+
+void setDirectFileAccessEnabled(bool enabled) {
+    callActivity("setDirectFileAccessEnabled", jboolean(enabled));
+}
+
+bool allFilesAccessGranted() {
+    const auto activity = QNativeInterface::QAndroidApplication::context();
+    return activity.isValid() && activity.callMethod<jboolean>("allFilesAccessGranted");
+}
+
+void requestAllFilesAccess() { callActivity("requestAllFilesAccess"); }
+
+QString directSourcePath(const QString& uri) {
+    return activityString({}, "directSourcePath", uri);
+}
+
 QString prepareFinalizeOutput(const QString& folderName, const QString& mode,
                               const QString& importPath, bool createSubfolder) {
     return activityString(QStringLiteral("error:Android activity unavailable"),

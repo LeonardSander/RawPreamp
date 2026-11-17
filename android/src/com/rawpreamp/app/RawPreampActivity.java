@@ -12,6 +12,11 @@ import android.widget.ImageView;
 import android.widget.FrameLayout;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
+import android.provider.Settings;
+import androidx.core.content.FileProvider;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.os.Bundle;
@@ -49,6 +54,9 @@ public class RawPreampActivity extends QtActivity {
     private static final int CHOOSE_SIDECAR_DIRECTORY = 6302;
     private static final int CHOOSE_FINALIZE_DIRECTORY = 6303;
     private static final int CHOOSE_SEQUENCE_FOLDER = 6305;
+    private static final int INITIAL_ALL_FILES_ACCESS = 6306;
+    private static final String INITIAL_FILE_ACCESS_KEY = "initial_file_access_prompted";
+    private static final String INITIAL_FILE_ACCESS_PENDING_KEY = "initial_file_access_pending";
     private static final String PREFS = "rawpreamp_documents";
     private static final String FINALIZE_TREE_KEY = "finalize_tree_uri";
     private static final String CUSTOM_FINALIZE_TREE_KEY = "custom_finalize_tree_uri";
@@ -61,6 +69,8 @@ public class RawPreampActivity extends QtActivity {
     private PowerManager.WakeLock finalizeWakeLock;
     private boolean pendingFinalizeTree;
     private volatile String finalizeTreeSelectionStatus = "idle";
+    private File activeLocalFinalizeFolder;
+    private final ArrayList<File> activeLocalFinalizeFiles = new ArrayList<>();
     private Uri activeFinalizeFolder;
     private Uri activeFinalizeTree;
     private boolean activeFinalizeOwnsFolder;
@@ -72,6 +82,102 @@ public class RawPreampActivity extends QtActivity {
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         applyEdgeToEdge();
+        android.content.SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (prefs.getBoolean(INITIAL_FILE_ACCESS_PENDING_KEY, false)) {
+            // Recover the result if Android recreated the process while Settings was open.
+            finishInitialFileAccessRequest();
+        } else if (!prefs.contains(INITIAL_FILE_ACCESS_KEY)) {
+            boolean freshInstall = prefs.getAll().isEmpty();
+            prefs.edit().putBoolean(INITIAL_FILE_ACCESS_KEY, true).apply();
+            if (freshInstall && Build.VERSION.SDK_INT >= 30) {
+                if (allFilesAccessGranted()) setDirectFileAccessEnabled(true);
+                else {
+                    prefs.edit().putBoolean(INITIAL_FILE_ACCESS_PENDING_KEY, true).apply();
+                    launchAllFilesAccess(INITIAL_ALL_FILES_ACCESS);
+                }
+            }
+        }
+    }
+
+    private void finishInitialFileAccessRequest() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putBoolean("direct_file_access", allFilesAccessGranted())
+                .remove(INITIAL_FILE_ACCESS_PENDING_KEY).apply();
+    }
+
+    public boolean directFileAccessEnabled() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("direct_file_access", false);
+    }
+
+    public void setDirectFileAccessEnabled(boolean enabled) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("direct_file_access", enabled).apply();
+    }
+
+    public boolean allFilesAccessGranted() {
+        return Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager();
+    }
+
+    public void requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= 30) runOnUiThread(() -> launchAllFilesAccess(-1));
+    }
+
+    private void launchAllFilesAccess(int requestCode) {
+        try {
+            startActivityForResult(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName())), requestCode);
+        } catch (android.content.ActivityNotFoundException error) {
+            try {
+                startActivityForResult(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION), requestCode);
+            } catch (android.content.ActivityNotFoundException ignored) {
+                if (requestCode == INITIAL_ALL_FILES_ACCESS) finishInitialFileAccessRequest();
+            }
+        }
+    }
+
+    // Only the platform external-storage provider uses the volume:path
+    // identity handled here. Never guess filesystem paths for Downloads, cloud or opaque IDs.
+    private File localDocumentFile(String value) {
+        try {
+            Uri uri = sourceDocumentUri(value);
+            if (!"com.android.externalstorage.documents".equals(uri.getAuthority())) return null;
+            String id = documentIdentityId(uri);
+            int colon = id.indexOf(':');
+            if (colon < 0 || Build.VERSION.SDK_INT < 30) return null;
+            String volumeId = id.substring(0, colon);
+            StorageManager manager = (StorageManager) getSystemService(STORAGE_SERVICE);
+            for (StorageVolume volume : manager.getStorageVolumes()) {
+                if ((volume.isPrimary() && "primary".equals(volumeId)) ||
+                        (volume.getUuid() != null && volume.getUuid().equalsIgnoreCase(volumeId))) {
+                    File root = volume.getDirectory();
+                    return root == null ? null : resolveLocalFile(root, id.substring(colon + 1));
+                }
+            }
+        } catch (IOException | RuntimeException ignored) { }
+        return null;
+    }
+
+    public String directSourcePath(String value) {
+        if (!directFileAccessEnabled() || !allFilesAccessGranted()) return "";
+        File file = localDocumentFile(value);
+        return file != null && file.canRead() ? file.getAbsolutePath() : "";
+    }
+
+    // Private imports are URI indexes. Everything else is an actual filesystem
+    // source (including temporary archive extraction), never a provider index.
+    private boolean isLocalSource(String path) {
+        return path != null && new File(path).isAbsolute() && sourceKey(new File(path)) == null;
+    }
+
+    private File checkedLocalSource(String path, boolean sequence) throws IOException {
+        File source = new File(path).getCanonicalFile();
+        if (!source.canRead() || (sequence ? !source.isDirectory() : !source.isFile()))
+            throw new IOException("Source is unavailable. Restore All files access or reimport using the system picker.");
+        if (sequence) {
+            File[] frames = source.listFiles(file -> file.isFile() &&
+                    file.getName().toLowerCase(Locale.ROOT).endsWith(".dng"));
+            if (frames == null || frames.length < 2) throw new IOException("The source folder no longer contains a DNG sequence");
+        }
+        return source;
     }
 
     private ImageView pageFadeOverlay;
@@ -225,6 +331,30 @@ public class RawPreampActivity extends QtActivity {
     public synchronized String prepareFinalizeOutput(String requestedFolderName,
             String mode, String importPath, boolean createSubfolder) {
         try {
+            // Keep provider-only destinations on the retained-grant path.
+            File localOutput = null;
+            // Existing local clips keep their filesystem identity when the
+            // preference is disabled, including exports beside that source.
+            if (allFilesAccessGranted() && (directFileAccessEnabled() ||
+                    ("source".equals(mode) && isLocalSource(importPath)))) {
+                if ("source".equals(mode)) {
+                    if (isLocalSource(importPath)) localOutput = importDirectory(new File(importPath));
+                    else {
+                        String original = sessionSourceUri(importPath);
+                        File source = localDocumentFile(original);
+                        if (source != null) localOutput = isSequenceImport(new File(importPath)) ? source : source.getParentFile();
+                    }
+                } else if ("documents".equals(mode)) {
+                    localOutput = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "RawPreamp");
+                } else {
+                    String destination = mode.startsWith("content:") ? mode :
+                            getSharedPreferences(PREFS, MODE_PRIVATE).getString(CUSTOM_FINALIZE_TREE_KEY, "");
+                    localOutput = localDocumentFile(destination);
+                }
+            }
+            if (localOutput != null) {
+                return prepareLocalFinalizeOutput(localOutput, requestedFolderName, createSubfolder);
+            }
             Uri output;
             Uri tree;
             if ("source".equals(mode)) {
@@ -299,6 +429,60 @@ public class RawPreampActivity extends QtActivity {
         } catch (Exception error) {
             return "error:" + error.getMessage();
         }
+    }
+
+    private static File resolveLocalFile(File root, String relative) throws IOException {
+        if (relative == null || new File(relative).isAbsolute()) throw new IOException("Invalid relative path");
+        File base = root.getCanonicalFile();
+        File file = new File(base, relative).getCanonicalFile();
+        if (!file.equals(base) && !file.toPath().startsWith(base.toPath()))
+            throw new IOException("Path escapes its storage directory");
+        String path = file.getPath();
+        if (path.contains("/Android/data/") || path.endsWith("/Android/data") ||
+                path.contains("/Android/obb/") || path.endsWith("/Android/obb"))
+            throw new IOException("App-private storage is unavailable");
+        return file;
+    }
+
+    private static void checkFilename(String name) throws IOException {
+        if (name == null || name.isEmpty() || name.equals(".") || name.equals("..") ||
+                name.contains("/") || name.contains("\\") || name.indexOf('\0') >= 0)
+            throw new IOException("Invalid filename");
+    }
+
+    private static void writeLocalSidecar(File directory, String name, String contents) throws IOException {
+        checkFilename(name);
+        File destination = resolveLocalFile(directory, name);
+        File temporary = File.createTempFile(".fuse-sidecar-", ".partial", directory);
+        try {
+            Files.write(temporary.toPath(), contents.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            Files.move(temporary.toPath(), destination.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally { Files.deleteIfExists(temporary.toPath()); }
+    }
+
+    private String prepareLocalFinalizeOutput(File parent, String requestedName, boolean subfolder)
+            throws IOException {
+        String name = requestedName == null || requestedName.isEmpty() ? "Finalized Clip" : requestedName;
+        checkFilename(name);
+        Files.createDirectories(parent.toPath());
+        String[] listing = parent.list();
+        if (listing == null) throw new IOException("Could not list the output directory");
+        Set<String> names = new HashSet<>(java.util.Arrays.asList(listing));
+        for (int suffix = 1; suffix < 10000; suffix++) {
+            String candidate = suffix == 1 ? name : name + " (" + suffix + ")";
+            File child = resolveLocalFile(parent, candidate);
+            if (subfolder) {
+                try { Files.createDirectory(child.toPath()); }
+                catch (java.nio.file.FileAlreadyExistsException error) { continue; }
+            } else if (!nativeOutputNameAvailable(names, candidate)) {
+                continue;
+            }
+            activeLocalFinalizeFolder = subfolder ? child : parent;
+            activeFinalizeOwnsFolder = subfolder;
+            activeLocalFinalizeFiles.clear();
+            return "ready:" + candidate;
+        }
+        throw new IOException("Could not reserve a unique output name");
     }
 
     private Set<String> childNames(Uri tree, Uri folder) throws IOException {
@@ -464,9 +648,21 @@ public class RawPreampActivity extends QtActivity {
     }
 
     private void writeFinalizeEntry(String name, FinalizeEntryWriter writer) throws IOException {
+        checkFilename(name);
+        if (activeLocalFinalizeFolder != null) {
+            File destination = resolveLocalFile(activeLocalFinalizeFolder, name);
+            if (destination.exists()) throw new IOException("An output file already exists: " + name);
+            File temporary = File.createTempFile(".fuse-output-", ".partial", activeLocalFinalizeFolder);
+            try {
+                try (OutputStream output = Files.newOutputStream(temporary.toPath())) {
+                    writer.write(output);
+                }
+                Files.move(temporary.toPath(), destination.toPath());
+                activeLocalFinalizeFiles.add(destination);
+            } finally { Files.deleteIfExists(temporary.toPath()); }
+            return;
+        }
         if (activeFinalizeFolder == null) throw new IOException("Output folder is not ready");
-        if (name == null || name.isEmpty() || name.contains("/") || name.contains("\\"))
-            throw new IOException("Invalid output filename");
         if (!activeFinalizeOwnsFolder && findChild(activeFinalizeTree, activeFinalizeFolder, name, null) != null)
             throw new IOException("An output file already exists: " + name);
         // Publish each file only after its complete contents have been written.
@@ -499,6 +695,8 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public synchronized void finishFinalizeOutput() {
+        activeLocalFinalizeFolder = null;
+        activeLocalFinalizeFiles.clear();
         activeFinalizeFolder = null;
         activeFinalizeTree = null;
         activeFinalizeOwnsFolder = false;
@@ -508,6 +706,15 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public synchronized void cancelFinalizeOutput() {
+        if (activeLocalFinalizeFolder != null) {
+            for (File file : activeLocalFinalizeFiles) {
+                try { Files.deleteIfExists(file.toPath()); } catch (IOException ignored) { }
+            }
+            // Never delete unrelated files added to a newly created folder.
+            if (activeFinalizeOwnsFolder) activeLocalFinalizeFolder.delete();
+            activeLocalFinalizeFiles.clear();
+            activeLocalFinalizeFolder = null;
+        }
         Uri folder = activeFinalizeFolder;
         boolean owned = activeFinalizeOwnsFolder;
         activeFinalizeFolder = null;
@@ -552,6 +759,15 @@ public class RawPreampActivity extends QtActivity {
         try {
             while (pendingSidecarIndex < pendingSidecarPaths.size()) {
                 String path = pendingSidecarPaths.get(pendingSidecarIndex++);
+                if (isLocalSource(path)) {
+                    File folder = importDirectory(checkedLocalSource(path, new File(path).isDirectory()));
+                    File[] files = folder.listFiles();
+                    if (files == null) throw new IOException("Could not read the source directory");
+                    if (scannedSidecarTrees.add(folder.getCanonicalPath()))
+                        for (File file : files)
+                            if (file.isFile() && !isClipFile(file.getName())) indexedSidecars++;
+                    continue;
+                }
                 Uri tree = grantedSourceTree(path);
                 boolean granted = tree != null;
                 if (granted) {
@@ -641,6 +857,10 @@ public class RawPreampActivity extends QtActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == INITIAL_ALL_FILES_ACCESS) {
+            finishInitialFileAccessRequest();
+            return;
+        }
         if (requestCode == CHOOSE_FINALIZE_DIRECTORY) {
             pendingFinalizeTree = false;
             if (resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
@@ -672,19 +892,23 @@ public class RawPreampActivity extends QtActivity {
                 return;
             }
             Uri tree = data.getData();
-            try {
-                getContentResolver().takePersistableUriPermission(tree,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION |
-                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            } catch (SecurityException error) {
-                sequenceFolderImportStatus = "error:Could not read the selected folder";
-                return;
+            String direct = directSourcePath(tree.toString());
+            if (direct.isEmpty()) {
+                try {
+                    getContentResolver().takePersistableUriPermission(tree,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                } catch (SecurityException error) {
+                    sequenceFolderImportStatus = "error:Could not read the selected folder";
+                    return;
+                }
             }
             sequenceFolderImportStatus = "indexing";
             beginFinalizeWork();
             new Thread(() -> {
                 try {
-                    File imported = indexDngSequenceFolder(tree);
+                    File imported = direct.isEmpty() ? indexDngSequenceFolder(tree)
+                            : checkedLocalSource(direct, true);
                     synchronized (sequenceFolderImportPaths) {
                         sequenceFolderImportPaths.add(imported.getAbsolutePath());
                     }
@@ -752,6 +976,7 @@ public class RawPreampActivity extends QtActivity {
         Map<String, Map<String, ArrayList<File>>> folders = new HashMap<>();
         Map<String, Uri> folderUris = new HashMap<>();
         for (String path : pendingSidecarPaths) {
+            if (isLocalSource(path)) continue;
             File imported = new File(path);
             Uri grant = grantedSourceTree(path);
             // Includes all clips covered by a newly selected parent grant.
@@ -985,6 +1210,10 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public String sourceDirectoryForImport(String importPath) {
+        if (isLocalSource(importPath)) {
+            File directory = importDirectory(new File(importPath));
+            return directory != null && directory.canRead() ? directory.getAbsolutePath() : "";
+        }
         Uri tree = grantedSourceTree(importPath);
         if (tree == null) return "";
         String token = importDirectory(new File(importPath)).getName();
@@ -1068,6 +1297,7 @@ public class RawPreampActivity extends QtActivity {
 
     // The granted source directory is authoritative; private entries only index URIs.
     public String syncSidecarsForImport(String importPath) {
+        if (isLocalSource(importPath)) return ""; // Sidecars already live beside the source.
         File imported = new File(importPath);
         File directory = importDirectory(imported);
         if (directory == null) return "";
@@ -1160,11 +1390,17 @@ public class RawPreampActivity extends QtActivity {
     }
 
     private String sourceIdentity(String value) {
+        try {
+            if (isLocalSource(value)) return new File(value).getCanonicalPath();
+            if (value.startsWith("file:")) return new File(Uri.parse(value).getPath()).getCanonicalPath();
+        } catch (IOException | RuntimeException ignored) { return ""; }
         if (!value.startsWith("content:")) {
             String folder = importDirectory(new File(value)).getName();
             value = getSharedPreferences(PREFS, MODE_PRIVATE).getString("source_uri:" + folder, "");
         }
         if (value.isEmpty()) return "";
+        File local = localDocumentFile(value);
+        if (local != null) return local.getAbsolutePath();
         Uri uri = sourceDocumentUri(value);
         try {
             String id = documentIdentityId(uri);
@@ -1180,6 +1416,7 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public String importSourceLocation(String importPath) {
+        if (isLocalSource(importPath)) return importDirectory(new File(importPath)).getAbsolutePath();
         File imported = new File(importPath);
         String folder = importDirectory(imported).getName();
         String location = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -1233,6 +1470,7 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public String sessionSourceUri(String importPath) {
+        if (isLocalSource(importPath)) return Uri.fromFile(new File(importPath)).toString();
         File imported = new File(importPath);
         File directory = importDirectory(imported);
         if (directory == null) return "";
@@ -1265,6 +1503,8 @@ public class RawPreampActivity extends QtActivity {
     // Restore source identity using existing grants; never guess by filename.
     public String restoreSessionSource(String sourceUri, String name, boolean sequence) {
         try {
+            if (sourceUri.startsWith("file:"))
+                return checkedLocalSource(Uri.parse(sourceUri).getPath(), sequence).getAbsolutePath();
             Uri original = sourceDocumentUri(sourceUri);
             if (!sequence && (name.isEmpty() || name.equals(".") || name.equals("..") ||
                     name.contains("/") || name.contains("\\"))) return "";
@@ -1305,6 +1545,13 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public String refreshImportedSource(String importPath) {
+        if (isLocalSource(importPath)) {
+            File source = new File(importPath);
+            // The decoder validates the format, including extracted archives
+            // containing a single DNG. No provider index needs refreshing.
+            return source.canRead() && (source.isFile() || source.isDirectory()) ? "" :
+                    "Source is unavailable. Restore All files access or reimport using the system picker.";
+        }
         File file = new File(importPath);
         String key = sourceKey(file);
         if (key == null || key.isEmpty()) return "";
@@ -1360,8 +1607,14 @@ public class RawPreampActivity extends QtActivity {
 
     public String writeSidecarToSource(String importPath, String name,
             String contents) {
-        if (name == null || name.contains("/") || name.contains("\\"))
-            return "Invalid sidecar filename";
+        try { checkFilename(name); }
+        catch (IOException error) { return "Invalid sidecar filename"; }
+        if (isLocalSource(importPath)) {
+            try {
+                writeLocalSidecar(importDirectory(new File(importPath)), name, contents);
+                return "";
+            } catch (IOException error) { return "Could not write " + name + ": " + error.getMessage(); }
+        }
         Uri tree = grantedSourceTree(importPath);
         if (tree == null) return "Grant access to the clip's source folder first";
         try {
@@ -1382,13 +1635,22 @@ public class RawPreampActivity extends QtActivity {
     }
 
     public String editSidecarInExternalApp(String importPath, String name) {
-        if (name == null || name.contains("/") || name.contains("\\"))
-            return "Invalid sidecar filename";
-        Uri tree = grantedSourceTree(importPath);
-        if (tree == null) return "Grant access to the clip's source folder first";
-        Uri root = sourceFolder(tree, new File(importPath));
-        Uri document = findChild(tree, root, name, null);
-        if (document == null) return "Source JSON file not found";
+        try { checkFilename(name); }
+        catch (IOException error) { return "Invalid sidecar filename"; }
+        Uri document;
+        if (isLocalSource(importPath)) {
+            try {
+                File file = resolveLocalFile(importDirectory(new File(importPath)), name);
+                if (!file.isFile()) return "Source JSON file not found";
+                document = FileProvider.getUriForFile(this, getPackageName() + ".qtprovider", file);
+            } catch (IOException | IllegalArgumentException error) { return "Could not share source JSON: " + error.getMessage(); }
+        } else {
+            Uri tree = grantedSourceTree(importPath);
+            if (tree == null) return "Grant access to the clip's source folder first";
+            Uri root = sourceFolder(tree, new File(importPath));
+            document = findChild(tree, root, name, null);
+            if (document == null) return "Source JSON file not found";
+        }
         Intent edit = new Intent(Intent.ACTION_EDIT);
         edit.setDataAndType(document, "text/plain");
         edit.setClipData(ClipData.newUri(getContentResolver(), name, document));

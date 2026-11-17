@@ -24,7 +24,7 @@
 #ifdef __ANDROID__
 #include "android/ExportDirectory.h"
 #include <QTimer>
-#include <QScrollBar>
+#include <QGuiApplication>
 #endif
 
 SettingsDialog::SettingsDialog(QWidget *parent)
@@ -50,24 +50,16 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     auto* outerLayout = new QVBoxLayout(this);
     auto* content = new QWidget(this);
     auto* mainLayout = new QVBoxLayout(content);
-    if (rawpreamp::touchUi()) {
-        auto* scroll = new QScrollArea(this);
-        scroll->setWidgetResizable(true);
-        scroll->setFrameShape(QFrame::NoFrame);
-        scroll->setWidget(content);
-        outerLayout->addWidget(scroll, 1);
-        new rawpreamp::TouchScrolling(scroll);
-    } else {
-        auto* scroll = new QScrollArea(this);
-        scroll->setWidgetResizable(true);
-        scroll->setFrameShape(QFrame::NoFrame);
-        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        // Keep the controls at their preferred height when the window is short.
-        content->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
-        mainLayout->setSizeConstraint(QLayout::SetMinimumSize);
-        scroll->setWidget(content);
-        outerLayout->addWidget(scroll, 1);
-    }
+    auto* scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // Let the outer scroll area handle short windows and all clip settings.
+    content->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
+    mainLayout->setSizeConstraint(QLayout::SetMinimumSize);
+    scroll->setWidget(content);
+    outerLayout->addWidget(scroll, 1);
+    if (rawpreamp::touchUi()) new rawpreamp::TouchScrolling(scroll);
 #ifndef __ANDROID__
     auto* interfaceGroup = new QGroupBox(tr("Interface"), this);
     auto* interfaceLayout = new QVBoxLayout(interfaceGroup);
@@ -293,19 +285,11 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     QVBoxLayout* clipSettingsLayout = nullptr;
     QVBoxLayout* secondClipSettingsLayout = nullptr;
     if (rawpreamp::touchUi()) {
-        auto* clipGroupLayout = new QVBoxLayout(clipSettingsGroup);
-        clipGroupLayout->setContentsMargins(0, 0, 0, 0);
-        auto* clipScrollArea = new QScrollArea(clipSettingsGroup);
-        clipScrollArea->setWidgetResizable(true);
-        clipScrollArea->setFrameShape(QFrame::NoFrame);
-        clipScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        clipScrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        auto* clipContent = new QWidget(clipScrollArea);
-        auto* clipColumns = new QHBoxLayout(clipContent);
+        auto* clipColumns = new QHBoxLayout(clipSettingsGroup);
         clipColumns->setContentsMargins(8, 8, 8, 8);
         clipColumns->setSpacing(12);
-        auto* firstColumn = new QWidget(clipContent);
-        auto* secondColumn = new QWidget(clipContent);
+        auto* firstColumn = new QWidget(clipSettingsGroup);
+        auto* secondColumn = new QWidget(clipSettingsGroup);
         clipSettingsLayout = new QVBoxLayout(firstColumn);
         secondClipSettingsLayout = new QVBoxLayout(secondColumn);
         for (auto* columnLayout : {clipSettingsLayout, secondClipSettingsLayout}) {
@@ -314,10 +298,6 @@ SettingsDialog::SettingsDialog(QWidget *parent)
         }
         clipColumns->addWidget(firstColumn, 1);
         clipColumns->addWidget(secondColumn, 1);
-        clipScrollArea->setWidget(clipContent);
-        clipGroupLayout->addWidget(clipScrollArea);
-        new rawpreamp::TouchScrolling(clipScrollArea);
-        clipScrollArea->setMinimumHeight(360);
     } else {
         clipSettingsLayout = new QVBoxLayout(clipSettingsGroup);
     }
@@ -354,6 +334,41 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     mGalleryFpsIndicatorCheckBox = new QCheckBox("Show FPS indicator in gallery", this);
     mGalleryFpsIndicatorCheckBox->setChecked(true);
     clipSettingsLayout->addWidget(mGalleryFpsIndicatorCheckBox);
+#ifdef __ANDROID__
+    mAndroidDirectFileAccessCheckBox = new QCheckBox(tr("Use direct access for local files"), this);
+    mAndroidDirectFileAccessCheckBox->setObjectName(QStringLiteral("androidDirectFileAccess"));
+    mAndroidDirectFileAccessCheckBox->setToolTip(tr("Requires Android's All files access permission for local clips and sidecars."));
+    mAndroidDirectFileAccessCheckBox->setChecked(
+        rawpreamp::directFileAccessEnabled() && rawpreamp::allFilesAccessGranted());
+    clipSettingsLayout->addWidget(mAndroidDirectFileAccessCheckBox);
+    auto* directFileAccessHelpLabel = new QLabel(helpSpan(tr(
+        "Reads local clips and sidecars without folder grants. Requires Android's All files access permission.")), this);
+    directFileAccessHelpLabel->setWordWrap(true);
+    clipSettingsLayout->addWidget(directFileAccessHelpLabel);
+    connect(mAndroidDirectFileAccessCheckBox, &QCheckBox::clicked, this, [this](bool checked) {
+        mAndroidFileAccessPending = false;
+        mAndroidFileAccessLeftApp = false;
+        if (!checked || rawpreamp::allFilesAccessGranted()) return;
+        // Leave the option unchecked until Android actually grants access.
+        mAndroidDirectFileAccessCheckBox->setChecked(false);
+        mAndroidFileAccessPending = true;
+        rawpreamp::requestAllFilesAccess();
+    });
+    connect(qGuiApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+        if (state != Qt::ApplicationActive) {
+            if (mAndroidFileAccessPending) mAndroidFileAccessLeftApp = true;
+            return;
+        }
+        const bool granted = rawpreamp::allFilesAccessGranted();
+        if (mAndroidFileAccessPending && mAndroidFileAccessLeftApp) {
+            mAndroidFileAccessPending = false;
+            mAndroidFileAccessLeftApp = false;
+            mAndroidDirectFileAccessCheckBox->setChecked(granted);
+        } else if (!granted) {
+            mAndroidDirectFileAccessCheckBox->setChecked(false);
+        }
+    });
+#endif
     if (rawpreamp::touchUi()) {
         clipSettingsLayout->addStretch();
         clipSettingsLayout = secondClipSettingsLayout;
@@ -390,7 +405,7 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     heroSidecarHelpLabel->setWordWrap(true);
     clipSettingsLayout->addWidget(heroSidecarHelpLabel);
     if (rawpreamp::touchUi()) clipSettingsLayout->addStretch();
-    mainLayout->addWidget(clipSettingsGroup, rawpreamp::touchUi() ? 1 : 0);
+    mainLayout->addWidget(clipSettingsGroup);
 
     // Matrix override group (disabled for Fuse-AllV2)
     auto* matrixGroup = new QGroupBox("Color Matrix Override", this);
@@ -693,6 +708,12 @@ void SettingsDialog::setMatrixProfiles(const QStringList& profiles)
 
 void SettingsDialog::onCacheFolderTextChanged(const QString& text)
 {
+#ifdef __ANDROID__
+    // Android uses document destinations, not the hidden desktop mount folder.
+    // A stale path from a saved session must not block unrelated preferences.
+    Q_UNUSED(text);
+    setCacheFolderWarning("");
+#else
     if (text.trimmed().isEmpty()) {
         setCacheFolderWarning("");
         return;
@@ -713,6 +734,7 @@ void SettingsDialog::onCacheFolderTextChanged(const QString& text)
 #endif
 
     setCacheFolderWarning("");
+#endif
 }
 
 void SettingsDialog::onCachePolicyChanged(int index)
@@ -823,6 +845,10 @@ void SettingsDialog::onClearNativeVideoCache()
 }
 
 #ifdef __ANDROID__
+bool SettingsDialog::getAndroidDirectFileAccess() const {
+    return mAndroidDirectFileAccessCheckBox->isChecked() && rawpreamp::allFilesAccessGranted();
+}
+
 void SettingsDialog::setAndroidFinalizeDestination(const QString& mode,
                                                    const QString& legacyCustomDirectory) {
     QString destination=mode;

@@ -17,6 +17,52 @@ and developer environment overrides require a separate Debug native build;
 they are ignored by delivered Release APKs. The build script and automated
 jobs compile only Release application code and Release vcpkg dependencies.
 
+## Optional All files access
+
+Android 11+ offers an optional direct local-storage mode. On a fresh install,
+the first launch opens Android's All files access settings once, with no extra
+in-app prompt. Granting access enables direct access; declining leaves it off
+and does not prompt again on subsequent launches.
+
+In **Preferences → Clip Settings**, **Use direct access for local files** reflects
+that choice. If access has not been granted, tapping the unchecked box opens
+Android's settings; returning checks the box only if access was granted. Accept
+Preferences to save a manual change. Document-provider access remains available
+when access is declined; normal imports never request this broad permission.
+
+The system pickers are still used to select sources and custom destinations.
+When both the option and grant are active, selections from Android's external
+storage provider on primary storage or mounted SD/USB volumes use their real
+filesystem paths. Local clips and DNG sequences need no private filename index
+or additional source-folder grant. The **Grant source folder access / rescan
+sidecars** button is hidden while direct access is enabled and granted; tapping
+a clip's calibration status still refreshes its sidecars. Adjacent sidecars and
+relative calibration references are read in place, and **Create JSON** writes
+beside the source.
+External editing shares the selected JSON through the existing Qt file provider.
+Other providers, including cloud and opaque document IDs, retain the existing
+URI and folder-grant workflow. All files access does not expand picker grants
+or allow reading other apps' private directories.
+
+Local output uses normal filesystem writes for Documents/RawPreamp, source
+folders, and custom folders on supported volumes. Exports retain unique names,
+publish complete entries, and roll back only files created by that export.
+Native MOV/MP4 export still uses seekable staging files before publication.
+
+Turning the option off affects subsequent imports and output destinations.
+Existing local clips keep direct access to their source folders, including
+sidecar writes and source-directory exports while Android still grants access.
+Previously imported provider clips keep their URI indexes.
+Reimport a provider clip after removing it to switch it to direct access.
+Sessions preserve local source paths. If Android access is revoked, restore or
+refresh reports unavailable local sources; grant access again or reimport them
+through the provider workflow. No source files are copied or moved during this
+switch. Broad permission declaration also requires review for Google Play
+publication; current APK distribution is by sideloading.
+
+The provider behavior described below applies when direct access is inactive
+or a selection has no supported local filesystem identity.
+
 Android cannot expose app-owned FUSE mounts. The `ProcessingFileSystem`
 backend keeps imported clips in-process for metadata, gallery previews, and
 finalization. The Android **Import clip** action uses the system picker. For a

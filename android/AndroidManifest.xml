@@ -7,6 +7,8 @@
     <!-- %%INSERT_PERMISSIONS -->
     <!-- %%INSERT_FEATURES -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Optional: requested only from Preferences, never during normal import. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <supports-screens
         android:anyDensity="true"
         android:largeScreens="true"

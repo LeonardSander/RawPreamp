@@ -2020,6 +2020,15 @@ MainWindow::MainWindow(QWidget *parent)
     auto* sidecarButton = new QPushButton(tr("Grant source folder access / rescan sidecars"),
                                          ui->dragAndDropScrollArea->widget());
     sidecarButton->setObjectName(QStringLiteral("scanSidecarDirectoryButton"));
+    auto updateSidecarButtonVisibility = [sidecarButton] {
+        sidecarButton->setVisible(
+            !(rawpreamp::directFileAccessEnabled() && rawpreamp::allFilesAccessGranted()));
+    };
+    updateSidecarButtonVisibility();
+    connect(qApp, &QGuiApplication::applicationStateChanged, sidecarButton,
+        [updateSidecarButtonVisibility](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive) updateSidecarButtonVisibility();
+        });
     sidecarButton->setToolTip(tr("Sidecars are refreshed automatically on import and session load. "
         "Grant access to a parent source folder once to include sidecars for its clips."));
     auto* utilityRow=new QHBoxLayout();
@@ -2155,6 +2164,15 @@ MainWindow::MainWindow(QWidget *parent)
                     QStringLiteral("mp4"), QStringLiteral("mkv")};
                 if (!supportedSuffixes.contains(QFileInfo(name).suffix().toLower()))
                     return {{}, tr("The selected file has no supported clip extension. Its reported name is: %1").arg(name)};
+                const QString directPath = rawpreamp::directSourcePath(sourcePath);
+                if (!directPath.isEmpty()) {
+                    FILE* source = rawpreamp::openSourceFile(directPath.toStdString());
+                    if (source) {
+                        std::fclose(source);
+                        return {directPath, {}};
+                    }
+                    // A provider can still support the document if direct open fails.
+                }
                 const QString directory = QStandardPaths::writableLocation(
                     QStandardPaths::AppLocalDataLocation) + QStringLiteral("/imports/") +
                     QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -6118,6 +6136,7 @@ void MainWindow::finalizeCameraNative(QWidget* fileWidget, const QString& reques
     const QString outputPath = outputDir.absoluteFilePath(outputBase + containerExtension);
     const QString jsonPath = outputDir.absoluteFilePath(outputBase + ".json");
     const QString outputGyroflowPath = outputDir.absoluteFilePath(outputBase + "_gyroflow.json");
+#ifndef __ANDROID__
     if (allowHardwareEncoder && ((!metadataOnly && QFile::exists(outputPath)) || QFile::exists(jsonPath) ||
          (!metadataOnly && QFile::exists(gyroflowPath) && QFile::exists(outputGyroflowPath))) &&
         QMessageBox::question(this, metadataOnly ? "Replace metadata output?"
@@ -6128,7 +6147,14 @@ void MainWindow::finalizeCameraNative(QWidget* fileWidget, const QString& reques
         return;
     }
 
+#endif
+
+#ifdef __ANDROID__
+    // Sources may be read-only even when the chosen output is writable.
+    QTemporaryDir staging;
+#else
     QTemporaryDir staging(outputDir.absoluteFilePath(".camera-native-XXXXXX"));
+#endif
     if (!staging.isValid()) {
         mFuseFilesystem->updateOptions(mountId, buildRenderSettings());
         QMessageBox::critical(this, "Camera Native finalization", "Could not create the staging directory.");
@@ -8413,6 +8439,10 @@ void MainWindow::applyPreferences(SettingsDialog& dialog) {
     mFinalizeSelectionToSingleDirectory = dialog.getFinalizeSelectionToSingleDirectory();
     mInheritHeroFrameSidecars = dialog.getInheritHeroFrameSidecars();
 #ifdef __ANDROID__
+    rawpreamp::setDirectFileAccessEnabled(dialog.getAndroidDirectFileAccess());
+    if (auto* sidecarButton = findChild<QPushButton*>("scanSidecarDirectoryButton"))
+        sidecarButton->setVisible(
+            !(rawpreamp::directFileAccessEnabled() && rawpreamp::allFilesAccessGranted()));
     QSettings(PACKAGE_NAME, APP_NAME).setValue(
         "android/finalizeDestination", dialog.getAndroidFinalizeDestination());
 #endif
