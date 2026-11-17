@@ -563,9 +563,9 @@ void testResidentCfaBinning() {
             rawpreamp::downloadVulkanResidentImage(reduced, actual.data(), actual.size()) &&
             actual == expected, "GPU CFA binning differs from CPU rounding");
     }
-#ifdef __ANDROID__
-    // App self-tests link the metadata writer; the standalone Linux decoder
-    // harness intentionally uses smaller utility implementations.
+#if defined(__ANDROID__) && defined(RAWPREAMP_TEST_HAS_DNG_WRITER)
+    // App self-tests link the metadata writer. Standalone codec tests on all
+    // platforms use smaller utility implementations without generateDng.
     {
         rawpreamp::CameraFrameMetadata frame{};
         frame.width = frame.originalWidth = width;

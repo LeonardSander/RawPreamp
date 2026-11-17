@@ -307,6 +307,7 @@ endif()
 target_include_directories(${PROJECT_NAME} PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}")
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE _FILE_OFFSET_BITS=64)
+target_compile_definitions(${PROJECT_NAME} PRIVATE RAWPREAMP_TEST_HAS_DNG_WRITER=1)
 option(RAWPREAMP_RELEASE_IPO "Enable supported link-time optimization in Release" ON)
 if(RAWPREAMP_RELEASE_IPO)
     include(CheckIPOSupported)
