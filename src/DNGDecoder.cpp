@@ -1428,6 +1428,8 @@ namespace {
         for (const auto& entry : entries) byIfd[entry.ifdOffset].push_back(&entry);
         std::optional<uint32_t> primary;
         uint64_t primaryPixels = 0;
+        int primaryKind = -1;
+        bool primaryFullResolution = false;
         auto scalar = [&](const TiffEntry& entry) -> uint32_t {
             return entry.type == TIFF_TYPE_SHORT
                 ? read16(data.data() + entry.valueOffset, little)
@@ -1437,10 +1439,14 @@ namespace {
         for (const auto& [ifd, ifdEntries] : byIfd) {
             const TiffEntry* width = nullptr;
             const TiffEntry* height = nullptr;
+            uint32_t photometric = 0;
+            uint32_t subfileType = 0;
             bool hasImagePayload = false;
             for (const auto* entry : ifdEntries) {
                 if (entry->tag == TIFF_TAG_IMAGE_WIDTH) width = entry;
                 else if (entry->tag == TIFF_TAG_IMAGE_HEIGHT) height = entry;
+                else if (entry->tag == TIFF_TAG_PHOTOMETRIC) photometric = scalar(*entry);
+                else if (entry->tag == 254) subfileType = scalar(*entry);
                 else if (entry->tag == TIFF_TAG_STRIP_OFFSETS ||
                          entry->tag == TIFF_TAG_TILE_OFFSETS ||
                          entry->tag == TIFF_TAG_JPEG_OFFSET)
@@ -1448,10 +1454,21 @@ namespace {
             }
             if (!width || !height || !hasImagePayload || !width->count || !height->count)
                 continue;
+            // Apple ProRAW can embed a rendered preview as large as the raw.
+            // Prefer raw image data over rendered images, and never select masks.
+            if (subfileType & 4u) continue;
+            const int kind = photometric == TIFF_PHOTOMETRIC_CFA || photometric == 34892
+                ? 2 : photometric == 2 ? 1 : 0;
+            const bool fullResolution = !(subfileType & 1u);
             const uint64_t pixels = static_cast<uint64_t>(scalar(*width)) * scalar(*height);
-            if (pixels && (!primary || pixels > primaryPixels)) {
+            if (pixels && (!primary || kind > primaryKind ||
+                (kind == primaryKind && fullResolution > primaryFullResolution) ||
+                (kind == primaryKind && fullResolution == primaryFullResolution &&
+                 pixels > primaryPixels))) {
                 primary = ifd;
                 primaryPixels = pixels;
+                primaryKind = kind;
+                primaryFullResolution = fullResolution;
             }
         }
         return primary;
@@ -5022,27 +5039,22 @@ static bool decodeOrCanonicalizeDng(std::vector<uint8_t>& data, bool backgroundW
     if (backgroundWork) yieldToForegroundDngWork();
     bool little = true;
     const auto entries = findTiffEntries(data, little);
-    if (entries.empty()) return false;
+    const auto primary = primaryImageIfd(data, entries, little);
+    if (!primary) return false;
     auto scalar = [&](const TiffEntry& e) -> uint32_t {
         return e.type == TIFF_TYPE_SHORT ? read16(data.data() + e.valueOffset, little)
                                          : read32(data.data() + e.valueOffset, little);
     };
-    const TiffEntry* photo = nullptr;
-    for (const auto& entry : entries) {
-        if (entry.tag == TIFF_TAG_PHOTOMETRIC) {
-            const uint32_t value = scalar(entry);
-            if (value == TIFF_PHOTOMETRIC_CFA || value == 34892 || value == 2) {
-                photo = &entry;
-                break;
-            }
-        }
-    }
-    if (!photo) return false;
     auto find = [&](uint16_t tag) -> const TiffEntry* {
         for (const auto& entry : entries)
-            if (entry.ifdOffset == photo->ifdOffset && entry.tag == tag) return &entry;
+            if (entry.ifdOffset == *primary && entry.tag == tag) return &entry;
         return nullptr;
     };
+    const auto* photo = find(TIFF_TAG_PHOTOMETRIC);
+    if (!photo || !photo->count) return false;
+    const uint32_t photometric = scalar(*photo);
+    if (photometric != TIFF_PHOTOMETRIC_CFA && photometric != 34892 && photometric != 2)
+        return false;
     // Compression and SamplesPerPixel have TIFF defaults of 1. Some valid DNG
     // writers omit them; materialize the defaults because later processing
     // stages intentionally operate on an explicit canonical IFD.
@@ -5728,21 +5740,10 @@ bool DNGDecoder::decodeImageBorrowed(std::vector<uint8_t>& data,
     // inserts it; keep that rare mutation off the caller's buffer.
     bool little = true;
     const auto entries = findTiffEntries(data, little);
-    const TiffEntry* photo = nullptr;
-    for (const auto& entry : entries) {
-        if (entry.tag != TIFF_TAG_PHOTOMETRIC) continue;
-        const uint32_t value = entry.type == TIFF_TYPE_SHORT
-            ? read16(data.data() + entry.valueOffset, little)
-            : read32(data.data() + entry.valueOffset, little);
-        if (value == TIFF_PHOTOMETRIC_CFA || value == 34892 || value == 2) {
-            photo = &entry;
-            break;
-        }
-    }
-    if (photo) {
+    if (const auto primary = primaryImageIfd(data, entries, little)) {
         auto has = [&](uint16_t tag) {
             return std::any_of(entries.begin(), entries.end(), [&](const TiffEntry& entry) {
-                return entry.ifdOffset == photo->ifdOffset && entry.tag == tag;
+                return entry.ifdOffset == *primary && entry.tag == tag;
             });
         };
         if (!has(TIFF_TAG_COMPRESSION) || !has(TIFF_TAG_SAMPLES_PER_PIXEL) ||
@@ -5997,11 +5998,8 @@ bool DNGDecoder::removeThumbnails(std::vector<uint8_t>& data) {
     std::map<uint32_t, std::vector<TiffEntry>> byIfd;
     for (const auto& entry : entries) byIfd[entry.ifdOffset].push_back(entry);
 
-    // Photometric interpretation does not reliably distinguish a primary image
-    // from an embedded preview: IFD0 is commonly a small RGB preview while the
-    // full-resolution raw image lives in a SubIFD. Preserve the image-bearing
-    // IFD with the greatest pixel area, regardless of whether it is CFA,
-    // LinearRaw, RGB, or another valid TIFF interpretation.
+    // Preserve the primary raw image even when IFD0 contains an equally large
+    // rendered preview (as in Apple ProRAW).
     const auto selectedPrimaryIfd = primaryImageIfd(data, entries, little);
     if (!selectedPrimaryIfd) return false;
     const uint32_t primaryIfd = *selectedPrimaryIfd;

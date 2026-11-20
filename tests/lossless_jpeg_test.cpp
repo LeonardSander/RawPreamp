@@ -684,7 +684,75 @@ static int testCpuSpatialGainFocused() {
     return 0;
 }
 
+static void testPrimaryRawSelection() {
+    for (unsigned short previewPhoto : {2, 6}) {
+        for (bool reduced : {false, true}) {
+            tinydngwriter::DNGImage images[2];
+            const unsigned short bits[] = {16, 16, 16};
+            std::vector<uint16_t> preview(8 * 8 * 3, 17);
+            std::vector<uint16_t> raw(8 * 8 * 3, 1234);
+            tinydngwriter::DNGWriter writer(false);
+            for (int i = 0; i < 2; ++i) {
+                auto& image = images[i];
+                image.SetBigEndian(false);
+                assert(image.SetImageWidth(8) && image.SetImageLength(8));
+                assert(image.SetRowsPerStrip(8) && image.SetSamplesPerPixel(3));
+                assert(image.SetBitsPerSample(3, bits));
+                assert(image.SetCompression(tinydngwriter::COMPRESSION_NONE));
+                assert(image.SetPhotometric(i ? 34892 : 2));
+                assert(image.SetSubfileType(i == 0 && reduced));
+                assert(image.SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG));
+                assert(image.SetWhiteLevel(65535));
+                const auto& pixels = i ? raw : preview;
+                assert(image.SetImageData(reinterpret_cast<const unsigned char*>(pixels.data()),
+                                          pixels.size() * sizeof(uint16_t)));
+                assert(writer.AddImage(&image));
+            }
+            std::ostringstream out(std::ios::binary);
+            std::string error;
+            assert(writer.WriteToFile(out, &error));
+            const auto encoded = out.str();
+            std::vector<uint8_t> bytes(encoded.begin(), encoded.end());
+            // The writer only accepts RGB/CFA/LinearRaw; mark IFD0 as YCbCr
+            // directly to model the ProRAW preview directory.
+            if (previewPhoto == 6) {
+                const uint32_t ifd = uint32_t(bytes[4]) | (uint32_t(bytes[5]) << 8) |
+                    (uint32_t(bytes[6]) << 16) | (uint32_t(bytes[7]) << 24);
+                const unsigned count = bytes[ifd] | (unsigned(bytes[ifd + 1]) << 8);
+                for (unsigned j = 0; j < count; ++j) {
+                    const size_t at = ifd + 2 + j * 12;
+                    if ((bytes[at] | (unsigned(bytes[at + 1]) << 8)) == 262)
+                        bytes[at + 8] = 6;
+                }
+            }
+            rawpreamp::DNGImageLayout layout;
+            assert(rawpreamp::DNGDecoder::getImageLayout(bytes, layout));
+            assert(layout.pixels == rawpreamp::DNGPixelLayout::LinearRGB);
+            rawpreamp::DecodedDNGImage decoded;
+            assert(rawpreamp::DNGDecoder::decodeImage(bytes, decoded, false, false));
+            assert(decoded.layout.pixels == rawpreamp::DNGPixelLayout::LinearRGB);
+            assert(decoded.samples == raw);
+            assert(rawpreamp::DNGDecoder::removeThumbnails(bytes));
+            assert(rawpreamp::DNGDecoder::decodeImage(bytes, decoded, false, false));
+            assert(decoded.samples == raw);
+        }
+    }
+    if (const char* path = std::getenv("RAWPREAMP_TEST_PRIMARY_RAW_FILE")) {
+        std::ifstream input(path, std::ios::binary);
+        assert(input.good());
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
+        assert(rawpreamp::DNGDecoder::removeThumbnails(bytes));
+        rawpreamp::DecodedDNGImage decoded;
+        assert(rawpreamp::DNGDecoder::decodeImage(bytes, decoded, false, true));
+        assert(decoded.layout.pixels == rawpreamp::DNGPixelLayout::LinearRGB);
+        assert(!decoded.samples.empty());
+        assert(*std::max_element(decoded.samples.begin(), decoded.samples.end()) > 0);
+    }
+}
+
 int main() {
+    testPrimaryRawSelection();
+    if (std::getenv("RAWPREAMP_TEST_PRIMARY_RAW_ONLY")) return 0;
     if (std::getenv("RAWPREAMP_TEST_RAW_DECODE_ONLY")) {
         testRawDecodeVulkan();
         return 0;
