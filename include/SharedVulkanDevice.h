@@ -63,6 +63,9 @@ inline pl_vulkan sharedVulkanDevice() {
         pl_log log = pl_log_create(PL_API_VER, &logParams);
         if (!log) return pl_vulkan{};
         pl_vk_inst_params instanceParams = pl_vk_inst_default_params;
+#ifdef RAWPREAMP_VULKAN_VALIDATION
+        instanceParams.debug = true;
+#endif
         instanceParams.get_proc_addr = galleryVulkanGetInstanceProcAddr();
 #ifdef _WIN32
         if (!instanceParams.get_proc_addr) { pl_log_destroy(&log); return pl_vulkan{}; }
@@ -169,6 +172,11 @@ inline bool vulkanNeedsFenceCompletion(pl_vulkan device) {
 inline pl_vulkan createGalleryVulkanContext(pl_log log) {
     if (auto context = createSharedVulkanContext(log)) return context;
     pl_vulkan_params params = pl_vulkan_default_params;
+#ifdef RAWPREAMP_VULKAN_VALIDATION
+    pl_vk_inst_params instanceParams = pl_vk_inst_default_params;
+    instanceParams.debug = true;
+    params.instance_params = &instanceParams;
+#endif
     params.get_proc_addr = galleryVulkanGetInstanceProcAddr();
 #ifdef _WIN32
     if (!params.get_proc_addr) return nullptr;

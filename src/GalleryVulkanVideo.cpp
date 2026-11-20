@@ -1051,6 +1051,15 @@ GalleryVulkanVideo::GalleryVulkanVideo(QWidget* parent) : QWidget(parent) {
     mInstance = std::make_unique<QVulkanInstance>();
     const auto shared = rawpreamp::sharedVulkanDevice();
     if (shared) mInstance->setVkInstance(shared->instance);
+#ifdef RAWPREAMP_VULKAN_VALIDATION
+    if (!shared) {
+        const QByteArray validationLayer("VK_LAYER_KHRONOS_validation");
+        if (mInstance->supportedLayers().contains(validationLayer))
+            mInstance->setLayers({validationLayer});
+        else
+            spdlog::warn("Gallery Vulkan validation layer unavailable");
+    }
+#endif
     mInstance->setApiVersion(QVersionNumber(1, 2));
     if (!mInstance->create()) {
         spdlog::warn("Gallery native Vulkan instance unavailable: {}",

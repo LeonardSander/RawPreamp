@@ -924,6 +924,10 @@ public:
 private:
     void createFallback() {
 #if defined(RAWPREAMP_HAS_QUICKWIDGETS) && !defined(Q_OS_ANDROID)
+#ifdef RAWPREAMP_VULKAN_VALIDATION
+        if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan)
+            qputenv("QSG_RHI_DEBUG_LAYER", "1");
+#endif
         mQuick = new QQuickWidget(this);
         connect(mQuick, &QQuickWidget::sceneGraphError, this,
             [this](QQuickWindow::SceneGraphError, const QString& message) {

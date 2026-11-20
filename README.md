@@ -381,6 +381,13 @@ lookup. macOS includes the Vulkan loader; CMake also bundles MoltenVK when found
 `RAWPREAMP_REQUIRE_VULKAN=ON` and runs the tests on Windows and both macOS
 architectures. This build requirement retains CPU fallback at runtime. Windows
 and macOS hardware validation remains outstanding.
+
+CMake Debug builds request `VK_LAYER_KHRONOS_validation` for Vulkan processing,
+native video decode, and presentation. Install the Vulkan SDK or your
+platform's validation-layer package and make the layer available to the
+Vulkan loader. On Android, make the layer available to the debug app on the
+device. GPU processing can still run when the layer is missing.
+
 Set `RAWPREAMP_GALLERY_FFMPEG_PRESENT=1` to compare the previous FFmpeg presenter.
 
 ---

@@ -141,10 +141,22 @@ AVBufferRef* acquireHardwareDevice(AVHWDeviceType type) {
     std::lock_guard lock(nativeVideoHardwareDeviceMutex);
     auto& shared = nativeVideoHardwareDevices[static_cast<int>(type)];
     if (!shared.reference) {
+        int created = 0;
+#ifdef RAWPREAMP_VULKAN_VALIDATION
+        if (type == AV_HWDEVICE_TYPE_VULKAN) {
+            AVDictionary* options = nullptr;
+            created = av_dict_set(&options, "debug", "1", 0);
+            if (created >= 0)
+                created = av_hwdevice_ctx_create(&shared.reference, type, nullptr, options, 0);
+            av_dict_free(&options);
+            if (created < 0)
+                spdlog::warn("NativeVideoDecoder: Vulkan device with validation failed ({}), retrying", created);
+        }
+#endif
         // Decoder devices do not present. Window-system extensions belong to
         // the gallery presenter and its shared Vulkan device.
-        const int created = av_hwdevice_ctx_create(
-            &shared.reference, type, nullptr, nullptr, 0);
+        if (!shared.reference)
+            created = av_hwdevice_ctx_create(&shared.reference, type, nullptr, nullptr, 0);
         if (created < 0) {
             nativeVideoHardwareDevices.erase(static_cast<int>(type));
             return nullptr;
