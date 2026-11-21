@@ -1,4 +1,5 @@
 #include "VulkanRawDecode.h"
+#include "SharedVulkanDevice.h"
 #include "DebugInstrumentation.h"
 #include <motioncam/Decoder.hpp>
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
@@ -407,8 +408,8 @@ void main() {
     }
 };
 State& rawState() {
-    static State value;
-    return value;
+    static VulkanProcessState<State> value;
+    return value.get();
 }
 bool dispatchBlocks(const uint8_t* bytes, size_t size, uint32_t width, uint32_t height,
                     uint32_t encodedWidth, uint32_t codec, const std::vector<uint32_t>& blocks,

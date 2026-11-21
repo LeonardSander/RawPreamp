@@ -11,8 +11,7 @@ namespace rawpreamp {
 VulkanHardwareBuffer::~VulkanHardwareBuffer() {
     if (!mDevice) return;
     const VkDevice device = mDevice->device;
-    if (mSubmitted) vkWaitForFences(device, 1, &mCompletion, VK_TRUE,
-        std::numeric_limits<uint64_t>::max());
+    waitForSampling();
     if (mCompletion) vkDestroyFence(device, mCompletion, nullptr);
     if (mCommandPool) vkDestroyCommandPool(device, mCommandPool, nullptr);
     if (mAcquire) vkDestroySemaphore(device, mAcquire, nullptr);
@@ -29,6 +28,12 @@ VulkanHardwareBuffer::~VulkanHardwareBuffer() {
     if (mMemory) vkFreeMemory(device, mMemory, nullptr);
     if (mBuffer) AHardwareBuffer_release(mBuffer);
 }
+
+bool VulkanHardwareBuffer::waitForSampling() const {
+    return !mSubmitted || vkWaitForFences(mDevice->device, 1, &mCompletion,
+        VK_TRUE, std::numeric_limits<uint64_t>::max()) == VK_SUCCESS;
+}
+
 bool VulkanHardwareBuffer::createSamplingPipeline() {
     // External-format conversion requires an immutable combined sampler.
     VkDescriptorSetLayoutBinding bindings[2]{};
@@ -192,7 +197,8 @@ bool VulkanHardwareBuffer::recordSampling(VkCommandBuffer command, VkImage outpu
     release[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
     release[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     release[0].dstAccessMask = 0;
-    release[1].oldLayout = release[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    release[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    release[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     release[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     release[1].dstAccessMask = 0;
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -211,8 +217,7 @@ bool VulkanHardwareBuffer::submitSampling(VkImage output, VkImageView outputView
     const uint32_t family = mDevice->queue_compute.index;
     if (mSubmitted) {
         // The caller has also completed libplacebo's wait on mOutputReady.
-        if (vkWaitForFences(mDevice->device, 1, &mCompletion, VK_TRUE,
-                std::numeric_limits<uint64_t>::max()) != VK_SUCCESS) {
+        if (!waitForSampling()) {
             closeAcquire();
             return false;
         }
@@ -288,8 +293,7 @@ bool VulkanHardwareBuffer::submitSampling(VkImage output, VkImageView outputView
     *releaseFd = exportAndroidReleaseFence(mDevice, mInputReleased, &exported);
     if (!exported) {
         // Exceptional fallback only: the caller may now safely delete AImage.
-        vkWaitForFences(mDevice->device, 1, &mCompletion, VK_TRUE,
-            std::numeric_limits<uint64_t>::max());
+        waitForSampling();
         return false;
     }
     *outputReady = mOutputReady;

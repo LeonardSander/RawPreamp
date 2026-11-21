@@ -1,4 +1,5 @@
 #include "DebugInstrumentation.h"
+#include "SharedVulkanDevice.h"
 #include "VulkanJpegDecode.h"
 
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
@@ -1226,17 +1227,17 @@ struct DecodeState {
 DecodeState& state() {
     // Destroy cached GPU resources before releasing their device owner, even
     // when lookup selection constructs this state before the first decode.
-    static auto contextLease = jpegContextLease();
-    static DecodeState value;
-    return value;
+    jpegContext();
+    static VulkanProcessState<DecodeState> value;
+    return value.get();
 }
 struct ResidentStates {
     std::mutex mutex;
     std::unordered_map<pl_gpu, std::unique_ptr<DecodeState>> states;
 };
 ResidentStates& residentStates() {
-    static ResidentStates value;
-    return value;
+    static VulkanProcessState<ResidentStates> value;
+    return value.get();
 }
 } // namespace
 

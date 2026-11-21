@@ -17,6 +17,9 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/pixdesc.h>
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+#include <libavutil/hwcontext_cuda.h>
+#endif
 }
 #include <libplacebo/filters.h>
 #include <libplacebo/renderer.h>
@@ -32,6 +35,10 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 #ifdef __ANDROID__
 #include <QDebug>
 #endif
@@ -49,6 +56,140 @@ void unlockQueue(void* context, uint32_t family, uint32_t index) {
     auto* vulkan = static_cast<AVVulkanDeviceContext*>(device->hwctx);
     vulkan->unlock_queue(device, family, index);
 }
+
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+struct CudaDriver {
+    void* library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    template<class T>
+    T symbol(const char* name) const {
+        return reinterpret_cast<T>(library ? dlsym(library, name) : nullptr);
+    }
+    decltype(&cuCtxPushCurrent) push = symbol<decltype(push)>("cuCtxPushCurrent_v2");
+    decltype(&cuCtxPopCurrent) pop = symbol<decltype(pop)>("cuCtxPopCurrent_v2");
+    decltype(&cuCtxGetDevice) device = symbol<decltype(device)>("cuCtxGetDevice");
+    decltype(&cuDeviceGetUuid) uuid = symbol<decltype(uuid)>("cuDeviceGetUuid");
+    decltype(&cuImportExternalMemory) import = symbol<decltype(import)>("cuImportExternalMemory");
+    decltype(&cuExternalMemoryGetMappedBuffer) map = symbol<decltype(map)>("cuExternalMemoryGetMappedBuffer");
+    decltype(&cuDestroyExternalMemory) destroy = symbol<decltype(destroy)>("cuDestroyExternalMemory");
+    decltype(&cuMemFree) free = symbol<decltype(free)>("cuMemFree_v2");
+    decltype(&cuMemcpyDtoDAsync) copy = symbol<decltype(copy)>("cuMemcpyDtoDAsync_v2");
+    decltype(&cuStreamSynchronize) sync = symbol<decltype(sync)>("cuStreamSynchronize");
+
+    bool available() const {
+        return push && pop && device && uuid && import && map && destroy && free && copy && sync;
+    }
+};
+
+const CudaDriver& cudaDriver() {
+    static const CudaDriver driver;
+    return driver;
+}
+
+struct CudaContext {
+    const CudaDriver& driver = cudaDriver();
+    bool active;
+    explicit CudaContext(CUcontext context)
+        : active(driver.available() && driver.push(context) == CUDA_SUCCESS) {}
+    ~CudaContext() {
+        CUcontext ignored;
+        if (active) driver.pop(&ignored);
+    }
+};
+
+struct CudaVulkanInput {
+    CUexternalMemory memory = nullptr;
+    CUdeviceptr address = 0;
+    pl_buf buffer = nullptr;
+
+    void reset(pl_gpu gpu, const CudaDriver& cuda) {
+        if (address) cuda.free(address);
+        if (memory) cuda.destroy(memory);
+        address = 0;
+        memory = nullptr;
+        pl_buf_destroy(gpu, &buffer);
+    }
+
+    bool prepare(pl_vulkan vk, const CudaDriver& cuda, size_t bytes) {
+        if (buffer && buffer->params.size >= bytes && address) return true;
+        reset(vk->gpu, cuda);
+        if (!(vk->gpu->export_caps.buf & PL_HANDLE_FD) || !vk->gpu->limits.buf_transfer)
+            return false;
+
+        CUdevice device;
+        CUuuid cudaUuid;
+        if (cuda.device(&device) != CUDA_SUCCESS || cuda.uuid(&cudaUuid, device) != CUDA_SUCCESS ||
+            std::memcmp(cudaUuid.bytes, vk->gpu->uuid, VK_UUID_SIZE) != 0)
+            return false;
+
+        pl_buf_params params{};
+        params.size = bytes;
+        params.memory_type = PL_BUF_MEM_DEVICE;
+        params.export_handle = PL_HANDLE_FD;
+        buffer = pl_buf_create(vk->gpu, &params);
+        if (!buffer) return false;
+
+        const int fd = dup(buffer->shared_mem.handle.fd);
+        if (fd < 0) return false;
+        CUDA_EXTERNAL_MEMORY_HANDLE_DESC handle{};
+        handle.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+        handle.handle.fd = fd;
+        handle.size = buffer->shared_mem.size;
+        if (cuda.import(&memory, &handle) != CUDA_SUCCESS) {
+            close(fd);
+            return false;
+        }
+        CUDA_EXTERNAL_MEMORY_BUFFER_DESC region{};
+        region.offset = buffer->shared_mem.offset;
+        region.size = bytes;
+        return cuda.map(&address, memory, &region) == CUDA_SUCCESS;
+    }
+
+    bool upload(pl_vulkan vk, AVCUDADeviceContext& device, AVFrame* source,
+                pl_tex textures[4], pl_frame& target) {
+        CudaContext ctx(device.cuda_ctx);
+        if (!ctx.active) return false;
+        const auto* frames = reinterpret_cast<const AVHWFramesContext*>(source->hw_frames_ctx->data);
+        const auto format = frames->sw_format;
+        if (format != AV_PIX_FMT_P010LE && format != AV_PIX_FMT_NV12) return false;
+        source->format = format;
+        pl_frame_from_avframe(&target, source);
+        source->format = AV_PIX_FMT_CUDA;
+        pl_plane_data planes[4]{};
+        if (pl_plane_data_from_pixfmt(planes, &target.repr.bits, format) != 2)
+            return false;
+        size_t size = 0;
+        size_t planeBytes[2]{};
+        for (int i = 0; i < 2; ++i) {
+            auto& plane = planes[i];
+            plane.width = i ? (source->width + 1) / 2 : source->width;
+            plane.height = i ? (source->height + 1) / 2 : source->height;
+            if (!source->data[i] || source->linesize[i] <= 0) return false;
+            plane.row_stride = static_cast<size_t>(source->linesize[i]);
+            const size_t rowBytes = plane.width * plane.pixel_stride;
+            if (rowBytes > plane.row_stride) return false;
+            planeBytes[i] = (plane.height - 1) * plane.row_stride + rowBytes;
+            plane.buf_offset = size;
+            size += (planeBytes[i] + 255) & ~size_t{255};
+        }
+        if (!prepare(vk, ctx.driver, size) || !pl_buf_export(vk->gpu, buffer))
+            return false;
+        while (pl_buf_poll(vk->gpu, buffer, UINT64_MAX)) {}
+        bool copied = true;
+        for (int i = 0; i < 2; ++i) {
+            copied &= ctx.driver.copy(address + planes[i].buf_offset,
+                reinterpret_cast<CUdeviceptr>(source->data[i]), planeBytes[i],
+                device.stream) == CUDA_SUCCESS;
+        }
+        if (ctx.driver.sync(device.stream) != CUDA_SUCCESS || !copied) return false;
+        for (int i = 0; i < 2; ++i) {
+            planes[i].buf = buffer;
+            if (!pl_upload_plane(vk->gpu, &target.planes[i], &textures[i], &planes[i]))
+                return false;
+        }
+        return true;
+    }
+};
+#endif
 
 } // namespace
 #endif
@@ -97,6 +238,9 @@ struct NativeVideoGpuRgb::State {
         VkSemaphore available = VK_NULL_HANDLE;
         std::shared_ptr<AndroidImport> imported;
         ~AndroidInput() {
+            // The external compute queue can still be writing this image
+            // when a cancelled preview never submits a libplacebo read.
+            if (imported) imported->hardware->waitForSampling();
             imported.reset();
             if (view) vkDestroyImageView(vk->device, view, nullptr);
             if (available) vkDestroySemaphore(vk->device, available, nullptr);
@@ -107,12 +251,15 @@ struct NativeVideoGpuRgb::State {
     std::vector<std::shared_ptr<AndroidImport>> androidImports;
 #endif
     AVBufferRef* deviceRef = nullptr;
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+    AVCUDADeviceContext* cudaDevice = nullptr;
+    CudaVulkanInput cudaInput;
+#endif
     AVFrame* output = nullptr;
     pl_log log = nullptr;
     pl_vulkan vulkan = nullptr;
     pl_renderer renderer = nullptr;
     pl_tex sourceTextures[4] = {};
-    pl_tex textures[4] = {};
     pl_tex sampleableOutput = nullptr;
     pl_frame outputTarget = {};
     bool outputTargetReady = false;
@@ -164,6 +311,12 @@ struct NativeVideoGpuRgb::State {
             releaseVulkanGalleryTextureDevice(vulkan->gpu);
         }
         if (vulkan) pl_gpu_finish(vulkan->gpu);
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+        if (cudaDevice && cudaInput.buffer) {
+            CudaContext ctx(cudaDevice->cuda_ctx);
+            if (ctx.active) cudaInput.reset(vulkan->gpu, ctx.driver);
+        }
+#endif
 #ifdef __ANDROID__
         androidInputs.clear();
         androidImports.clear();
@@ -172,7 +325,6 @@ struct NativeVideoGpuRgb::State {
         if (vulkan) {
             for (auto& texture : sourceTextures)
                 pl_tex_destroy(vulkan->gpu, &texture);
-            for (auto& texture : textures) pl_tex_destroy(vulkan->gpu, &texture);
             pl_tex_destroy(vulkan->gpu, &sampleableOutput);
         }
         pl_mpv_user_shader_destroy(&hlgHook);
@@ -189,16 +341,23 @@ struct NativeVideoGpuRgb::State {
     bool init(const AVFrame* source, int outputWidth, int outputHeight,
               bool outputBayer) {
         const bool softwareSource = !source->hw_frames_ctx;
+        bool useOwnVulkan = softwareSource;
         AVHWFramesContext* frames = softwareSource ? nullptr :
             reinterpret_cast<AVHWFramesContext*>(source->hw_frames_ctx->data);
         if (!softwareSource && (!frames || !frames->device_ref)) return false;
         auto* device = softwareSource ? nullptr :
             reinterpret_cast<AVHWDeviceContext*>(frames->device_ref->data);
-        if (!softwareSource && (!device || device->type != AV_HWDEVICE_TYPE_VULKAN))
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+        if (device && device->type == AV_HWDEVICE_TYPE_CUDA) {
+            cudaDevice = static_cast<AVCUDADeviceContext*>(device->hwctx);
+            useOwnVulkan = cudaDevice && cudaDriver().available();
+        }
+#endif
+        if (!useOwnVulkan && (!device || device->type != AV_HWDEVICE_TYPE_VULKAN))
             return false;
-        auto* hw = softwareSource ? nullptr :
+        auto* hw = useOwnVulkan ? nullptr :
             static_cast<AVVulkanDeviceContext*>(device->hwctx);
-        if (!softwareSource && (!hw || !hw->lock_queue || !hw->unlock_queue))
+        if (!useOwnVulkan && (!hw || !hw->lock_queue || !hw->unlock_queue))
             return false;
 
         pl_log_params logParams{};
@@ -208,7 +367,7 @@ struct NativeVideoGpuRgb::State {
         };
         log = pl_log_create(PL_API_VER, &logParams);
         if (!log) return false;
-        if (softwareSource) {
+        if (useOwnVulkan) {
             vulkan = createGalleryVulkanContext(log);
         } else {
         pl_vulkan_import_params params = {};
@@ -318,6 +477,13 @@ vec4 hook() {
                 const std::array<uint8_t, 4>* cfaPhase,
                 bool deferDownload, const pl_frame* externalInput = nullptr) {
         pending = false;
+        if (!outputTargetReady &&
+            !vulkanUsesUnifiedMemory(vulkan->instance, vulkan->phys_device, vulkan->get_proc_addr)) {
+            // The renderer needs a destination plus intermediate textures.
+            const size_t targetBytes = size_t(width) * height * 4 * sizeof(uint16_t);
+            if (!vulkanDeviceMemoryFits(vulkan, 3 * targetBytes))
+                return false;
+        }
         output->data[0] = reinterpret_cast<uint8_t*>(packedRgb);
         output->linesize[0] = width * (cfaPhase ? 1 : rgbaOutput ? 4 : 3) * sizeof(uint16_t);
         AVFrame* tagged = av_frame_clone(source);
@@ -337,7 +503,15 @@ vec4 hook() {
         inputParams.map_dovi = false;
         pl_frame input = externalInput ? *externalInput : pl_frame{};
         const auto mapStarted = rawpreamp::diagnosticNow();
-        const bool mapped = externalInput || pl_map_avframe_ex(vulkan->gpu, &input, &inputParams);
+        bool mapped;
+        bool mappedInternally = !externalInput;
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+        if (cudaDevice) {
+            mappedInternally = false;
+            mapped = cudaInput.upload(vulkan, *cudaDevice, tagged, sourceTextures, input);
+        } else
+#endif
+            mapped = externalInput || pl_map_avframe_ex(vulkan->gpu, &input, &inputParams);
         av_frame_free(&tagged);
         if (!mapped) {
             output->data[0] = nullptr;
@@ -350,22 +524,29 @@ vec4 hook() {
 
         if (!outputTargetReady) {
             pl_frame target = {};
-            if (pl_frame_recreate_from_avframe(vulkan->gpu, &target,
-                                              textures, output) &&
-                target.num_planes == 1 && target.planes[0].texture) {
-                const auto* base = target.planes[0].texture;
+            pl_frame_from_avframe(&target, output);
+            pl_plane_data planes[4]{};
+            if (pl_plane_data_from_pixfmt(planes, &target.repr.bits,
+                    static_cast<AVPixelFormat>(output->format)) == 1) {
+                planes[0].width = output->width;
+                planes[0].height = output->height;
+                auto& plane = target.planes[0];
+                const auto format = pl_plane_find_fmt(vulkan->gpu, plane.component_mapping, planes);
                 pl_tex_params sampleable = {};
-                sampleable.w = base->params.w;
-                sampleable.h = base->params.h;
-                sampleable.format = base->params.format;
+                sampleable.w = output->width;
+                sampleable.h = output->height;
+                sampleable.format = format;
                 sampleable.renderable = true;
                 sampleable.sampleable = true;
                 sampleable.host_readable = true;
-                if (pl_tex_recreate(vulkan->gpu, &sampleableOutput, &sampleable)) {
-                    target.planes[0].texture = sampleableOutput;
+                if (format && pl_tex_recreate(vulkan->gpu, &sampleableOutput, &sampleable)) {
+                    plane.components = 0;
+                    for (int i = 0; i < 4; ++i)
+                        if (plane.component_mapping[i] >= 0) plane.components = i + 1;
+                    plane.texture = sampleableOutput;
+                    target.num_planes = 1;
                     outputTarget = target;
                     outputTargetReady = true;
-                    pl_tex_destroy(vulkan->gpu, &textures[0]);
                 }
             }
         }
@@ -389,7 +570,8 @@ vec4 hook() {
                 ? reinterpret_cast<const AVHWFramesContext*>(
                     source->hw_frames_ctx->data) : nullptr;
             const pl_hook* hooks[3] = {};
-            if (!fullRange && frames && frames->sw_format == AV_PIX_FMT_P010LE)
+            if (!fullRange && source->format == AV_PIX_FMT_VULKAN &&
+                frames && frames->sw_format == AV_PIX_FMT_P010LE)
                 hooks[params.num_hooks++] = limited10Hook;
             if (transferHook) hooks[params.num_hooks++] = transferHook;
             if (cfaPhase) {
@@ -413,7 +595,7 @@ vec4 hook() {
                         shader.c_str(), shader.size());
                 }
                 if (!mosaicHook) {
-                    if (!externalInput) pl_unmap_avframe(vulkan->gpu, &input);
+                    if (mappedInternally) pl_unmap_avframe(vulkan->gpu, &input);
                     pl_gpu_flush(vulkan->gpu);
                     output->data[0] = nullptr;
                     output->linesize[0] = 0;
@@ -450,7 +632,7 @@ vec4 hook() {
                              ms(renderStart, downloadStart), ms(downloadStart, downloadEnd));
             }
         }
-        if (!externalInput) pl_unmap_avframe(vulkan->gpu, &input);
+        if (mappedInternally) pl_unmap_avframe(vulkan->gpu, &input);
         pl_gpu_flush(vulkan->gpu);
         output->data[0] = nullptr;
         output->linesize[0] = 0;
@@ -555,7 +737,20 @@ bool NativeVideoGpuRgb::renderAndroidImage(const AVFrame* source, AImage* image,
         lease->available = createAndroidReleaseSemaphore(lease->vk);
         if (!lease->available) return fail();
     }
-    lease->imported.reset();
+    pl_vulkan_hold_params hold{};
+    hold.tex = lease->texture;
+    hold.layout = VK_IMAGE_LAYOUT_GENERAL;
+    hold.qf = VK_QUEUE_FAMILY_IGNORED;
+    hold.semaphore = {lease->available, 0};
+    const bool recycled = bool(lease->imported);
+    if (recycled) {
+        if (!pl_vulkan_hold_ex(lease->vk->gpu, &hold)) return fail();
+        // A cancelled fused frame may never have submitted a read. Holding
+        // the texture submits a wait for its previous sampling semaphore.
+        // Finish that wait before making the import available to the cache.
+        pl_gpu_finish(lease->vk->gpu);
+        lease->imported.reset();
+    }
     for (auto it = mState->androidImports.begin(); it != mState->androidImports.end();) {
         // Only reuse submission resources after their output read has completed.
         const bool sameBuffer = hasBufferId && (*it)->hasId
@@ -583,12 +778,7 @@ bool NativeVideoGpuRgb::renderAndroidImage(const AVFrame* source, AImage* image,
         lease->imported = imported;
         mState->androidImports.push_back(std::move(imported));
     }
-    pl_vulkan_hold_params hold{};
-    hold.tex = lease->texture;
-    hold.layout = VK_IMAGE_LAYOUT_GENERAL;
-    hold.qf = lease->vk->queue_compute.index;
-    hold.semaphore = {lease->available, 0};
-    if (!pl_vulkan_hold_ex(lease->vk->gpu, &hold)) return fail();
+    if (!recycled && !pl_vulkan_hold_ex(lease->vk->gpu, &hold)) return fail();
     const char* fusionSetting = rawpreamp::debugEnvironment("RAWPREAMP_ANDROID_FUSED_DECODE");
     const bool fused = deferDownload && !cfaPhase &&
         width == source->width && height == source->height &&
@@ -607,8 +797,8 @@ bool NativeVideoGpuRgb::renderAndroidImage(const AVFrame* source, AImage* image,
     image = nullptr;
     pl_vulkan_release_params release{};
     release.tex = lease->texture;
-    release.layout = VK_IMAGE_LAYOUT_GENERAL;
-    release.qf = lease->vk->queue_compute.index;
+    release.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    release.qf = VK_QUEUE_FAMILY_IGNORED;
     release.semaphore = {ready, 0};
     pl_vulkan_release_ex(lease->vk->gpu, &release);
     pl_frame input{};

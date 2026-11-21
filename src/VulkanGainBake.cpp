@@ -329,8 +329,8 @@ struct BakeState {
     std::future<void> warmup;
 };
 BakeState& bakeState() {
-    static BakeState state;
-    return state;
+    static VulkanProcessState<BakeState> bake;
+    return bake.get();
 }
 } // namespace
 

@@ -51,6 +51,7 @@ public:
     void setAutomaticAdvanceEnabled(bool enabled);
     void setPlaybackPaused(bool paused);
     bool isPlaybackPaused() const { return mPaused; }
+    bool isClosing() const { return mClosing; }
     bool directSequencePresentation() const { return mDirectSequencePresentation; }
     void requestThumbnailBackfill();
     QPair<int,int> visibleThumbnailOutputRange() const;

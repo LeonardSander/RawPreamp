@@ -1557,10 +1557,16 @@ bool waitVulkanGalleryPreviewReady() {
 }
 
 void releaseVulkanGalleryTextureDevice(const void* gpu) {
-    std::lock_guard lock(deviceMutex);
-    textureDevices.erase(static_cast<pl_gpu>(gpu));
-    bufferDevices.erase(static_cast<pl_gpu>(gpu));
-    bayerTextureDevices.erase(static_cast<pl_gpu>(gpu));
+    decltype(DeviceCache::textureDevices)::node_type texture, buffer, bayer;
+    {
+        std::lock_guard lock(deviceMutex);
+        const auto key = static_cast<pl_gpu>(gpu);
+        texture = textureDevices.extract(key);
+        buffer = bufferDevices.extract(key);
+        bayer = bayerTextureDevices.extract(key);
+    }
+    // Destruction waits for the retired device's submissions. Other devices
+    // can render while this decoder drains.
 }
 
 bool demosaicGalleryBayerVulkan(
@@ -1769,6 +1775,11 @@ bool colorGalleryRgbVulkan(
     const size_t paddedInput = texture ? 0u : (inputBytes + 3u) & ~size_t{3};
     const size_t paddedOutput = (outputBytes + 3u) & ~size_t{3};
     if (output && output->requireZeroCopy && !externalGpu) return false;
+    // A still can briefly hold both the producer output and presenter texture.
+    if (output && output->staticFrame && !output->requireZeroCopy &&
+        !selected->unifiedMemory &&
+        !vulkanDeviceMemoryFits(pl_vulkan_get(selected->gpu), 2 * paddedOutput))
+        return false;
     // Shared-image/storage-buffer output does not need a second full-frame
     // scratch buffer. Allocate it below only for paths that actually use it.
     if (!selected->reserve(paddedInput, paddedOutput, false)) return false;
@@ -2565,6 +2576,10 @@ bool colorGalleryRgbVulkan(
                 orientation == 90 || orientation == 270 ? sourceWidth : sourceHeight)
             : 0;
         const bool ready = pl_buf_export(selected->gpu, exported);
+        // Export submits its own command but bypasses libplacebo's normal
+        // flush housekeeping. Age freed allocation slabs on the producer,
+        // which is independent of the swapchain's Vulkan device.
+        pl_gpu_flush(selected->gpu);
         while (ready && pl_buf_poll(selected->gpu, exported, UINT64_MAX)) {}
         const int fd = ready ? ::dup(exported->shared_mem.handle.fd) : -1;
         if (fd < 0) {
@@ -2641,6 +2656,7 @@ bool colorGalleryRgbVulkan(
         return false;
     }
     enqueueThumbnailReadback();
+    pl_gpu_flush(selected->gpu);
     if (pooled) {
         *output->hostPixels = std::move(owned);
         rgb.clear();

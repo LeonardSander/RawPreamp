@@ -44,9 +44,13 @@ public:
                  std::function<void(size_t, int)> result,
                  bool async = true) override;
     bool materializePreviewFrame(const Entry& entry, PreviewFrame& frame,
-                                 bool retainSourceSamples = false) override;
+                                 bool retainSourceSamples = false,
+                                 const std::function<bool()>& cancelled = {}) override;
 
 private:
+    std::shared_ptr<std::vector<uint8_t>> materializeDng(
+        const Entry& entry, bool outputCompression, bool savedOutput, bool deferCompression,
+        const std::function<bool()>& cancelled);
     std::function<std::shared_ptr<std::vector<uint8_t>>()>
         staticMaterializer(const Entry& entry) override;
     struct FrameMetadata {
@@ -98,7 +102,8 @@ private:
                                 bool outputBayer = false,
                                 bool deferGpuDownload = false,
                                 bool textureOnly = false,
-                                bool packedGpuDng = false);
+                                bool packedGpuDng = false,
+                                const std::function<bool()>& cancelled = {});
     PreparedSidecarGainMaps prepareSidecarGainMaps(int frameNumber) const;
     void analyzeSidecarExposure();
     FrameMetadata frameMetadata(int frameNumber) const;

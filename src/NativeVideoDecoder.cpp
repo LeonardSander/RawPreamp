@@ -46,6 +46,64 @@ extern "C" {
 
 namespace {
 
+#if defined(RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO) && defined(VK_KHR_video_decode_h265)
+bool vulkanDecodeRequiresLayeredReferences(const AVVulkanDeviceContext& device,
+                                           const AVCodecParameters& codec) {
+    const auto* pixels = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(codec.format));
+    if (!device.get_proc_addr || !pixels || pixels->log2_chroma_w != 1 ||
+        pixels->log2_chroma_h != 1 || pixels->comp[0].depth != 10)
+        return false;
+
+    VkVideoProfileInfoKHR profile{};
+    profile.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
+    profile.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
+    profile.lumaBitDepth = profile.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR;
+    VkVideoDecodeCapabilitiesKHR decode{};
+    decode.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR;
+    VkVideoDecodeH265ProfileInfoKHR hevc{};
+    VkVideoDecodeH265CapabilitiesKHR hevcCaps{};
+#ifdef VK_KHR_video_decode_av1
+    VkVideoDecodeAV1ProfileInfoKHR av1{};
+    VkVideoDecodeAV1CapabilitiesKHR av1Caps{};
+#endif
+    switch (codec.codec_id) {
+    case AV_CODEC_ID_HEVC:
+        if (codec.profile != AV_PROFILE_HEVC_MAIN_10) return false;
+        profile.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
+        hevc.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PROFILE_INFO_KHR;
+        hevc.stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN_10;
+        profile.pNext = &hevc;
+        hevcCaps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR;
+        decode.pNext = &hevcCaps;
+        break;
+#ifdef VK_KHR_video_decode_av1
+    case AV_CODEC_ID_AV1:
+        if (codec.profile != AV_PROFILE_AV1_MAIN) return false;
+        profile.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
+        av1.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_PROFILE_INFO_KHR;
+        av1.stdProfile = STD_VIDEO_AV1_PROFILE_MAIN;
+        av1.filmGrainSupport = VK_TRUE;
+        profile.pNext = &av1;
+        av1Caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_CAPABILITIES_KHR;
+        decode.pNext = &av1Caps;
+        break;
+#endif
+    default:
+        return false;
+    }
+
+    const auto getCapabilities = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
+        device.get_proc_addr(device.inst, "vkGetPhysicalDeviceVideoCapabilitiesKHR"));
+    VkVideoCapabilitiesKHR caps{};
+    caps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
+    caps.pNext = &decode;
+    return getCapabilities && getCapabilities(device.phys_dev, &profile, &caps) == VK_SUCCESS &&
+        !(caps.flags & VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR) &&
+        (decode.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR) &&
+        !(decode.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR);
+}
+#endif
+
 std::string_view videoBasename(std::string_view path) {
     const auto separator = path.find_last_of("/\\");
     return separator == std::string_view::npos ? path : path.substr(separator + 1);
@@ -323,8 +381,9 @@ void parallelPixelRanges(size_t count, Function&& function) {
 
 namespace rawpreamp {
 
-NativeVideoDecoder::NativeVideoDecoder(const std::string& filePath)
+NativeVideoDecoder::NativeVideoDecoder(const std::string& filePath, bool thumbnailPreview)
     : mFilePath(filePath),
+      mThumbnailPreview(thumbnailPreview),
       mFormatContext(nullptr),
       mCodecContext(nullptr),
       mCodec(nullptr),
@@ -718,34 +777,36 @@ void NativeVideoDecoder::analyzeVideo() {
 
 bool NativeVideoDecoder::extractFrame(int frameNumber, std::vector<uint16_t>& rgbData,
                                     int outputWidth, int outputHeight,
-                                    bool preserveLogEncoded, bool smoothChroma) {
+                                    bool preserveLogEncoded, bool smoothChroma,
+                                    const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0) return false;
     rgbData.resize(static_cast<size_t>(width) * height * 3);
     return extractFrameInto(frameNumber, rgbData.data(), rgbData.size(),
-                            width, height, preserveLogEncoded, smoothChroma);
+                            width, height, preserveLogEncoded, smoothChroma,
+                            nullptr, false, false, cancelled);
 }
 
 bool NativeVideoDecoder::extractFrameDeferred(int frameNumber,
         std::vector<uint16_t>& rgbData, int outputWidth, int outputHeight,
-        bool smoothChroma) {
+        bool smoothChroma, const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0) return false;
     rgbData.resize(static_cast<size_t>(width) * height * 3);
     return extractFrameInto(frameNumber, rgbData.data(), rgbData.size(),
-                            width, height, false, smoothChroma, nullptr, true);
+                            width, height, false, smoothChroma, nullptr, true, false, cancelled);
 }
 
 bool NativeVideoDecoder::extractFrameTextureDeferred(int frameNumber,
         int outputWidth, int outputHeight, bool smoothChroma,
-        const std::array<uint8_t, 4>* cfaPhase) {
+        const std::array<uint8_t, 4>* cfaPhase, const std::function<bool()>& cancelled) {
     if (outputWidth <= 0 || outputHeight <= 0) return false;
     uint16_t unused = 0;
     return extractFrameInto(frameNumber, &unused,
         static_cast<size_t>(outputWidth) * outputHeight * (cfaPhase ? 1u : 3u),
-        outputWidth, outputHeight, false, smoothChroma, cfaPhase, true, true);
+        outputWidth, outputHeight, false, smoothChroma, cfaPhase, true, true, cancelled);
 }
 
 bool NativeVideoDecoder::canExtractFrameTexture() {
@@ -753,6 +814,7 @@ bool NativeVideoDecoder::canExtractFrameTexture() {
     const char* enabled = rawpreamp::debugEnvironment("RAWPREAMP_NATIVE_VIDEO_GPU_RGB");
     if (enabled && enabled[0] == '0') return false;
     initDecoder();
+    if (mThumbnailPreview && mHardwarePixelFormat == AV_PIX_FMT_CUDA) return false;
     // Software YUV can also be uploaded to the common Vulkan renderer;
     // hardware formats without an import adapter transfer before that upload.
     return !mGpuRgbRejected && !mForceSoftwareDecoder &&
@@ -766,31 +828,32 @@ bool NativeVideoDecoder::canExtractFrameTexture() {
 bool NativeVideoDecoder::extractFrameBayer(int frameNumber,
         std::vector<uint16_t>& bayerData,
         const std::array<uint8_t, 4>& cfaPhase,
-        int outputWidth, int outputHeight) {
+        int outputWidth, int outputHeight, const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0) return false;
     bayerData.resize(static_cast<size_t>(width) * height);
     return extractFrameInto(frameNumber, bayerData.data(), bayerData.size(),
-                            width, height, false, false, &cfaPhase);
+                            width, height, false, false, &cfaPhase, false, false, cancelled);
 }
 
 bool NativeVideoDecoder::extractFrameBayerDeferred(int frameNumber,
         std::vector<uint16_t>& bayerData,
         const std::array<uint8_t, 4>& cfaPhase,
-        int outputWidth, int outputHeight) {
+        int outputWidth, int outputHeight, const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0) return false;
     bayerData.resize(static_cast<size_t>(width) * height);
     return extractFrameInto(frameNumber, bayerData.data(), bayerData.size(),
-                            width, height, false, false, &cfaPhase, true);
+                            width, height, false, false, &cfaPhase, true, false, cancelled);
 }
 
 bool NativeVideoDecoder::extractFrameBayerIntoBytes(int frameNumber,
         std::vector<uint8_t>& bytes, size_t pixelOffset,
         const std::array<uint8_t, 4>& cfaPhase,
-        int outputWidth, int outputHeight, bool deferDownload) {
+        int outputWidth, int outputHeight, bool deferDownload,
+        const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0 || (pixelOffset & 1u)) return false;
@@ -803,13 +866,13 @@ bool NativeVideoDecoder::extractFrameBayerIntoBytes(int frameNumber,
     bytes.resize(pixelOffset + samples * sizeof(uint16_t));
     return extractFrameInto(frameNumber,
         reinterpret_cast<uint16_t*>(bytes.data() + pixelOffset), samples,
-        width, height, false, false, &cfaPhase, deferDownload);
+        width, height, false, false, &cfaPhase, deferDownload, false, cancelled);
 }
 
 bool NativeVideoDecoder::extractFrameIntoBytes(int frameNumber,
         std::vector<uint8_t>& bytes, size_t pixelOffset,
         int outputWidth, int outputHeight,
-        bool preserveLogEncoded, bool smoothChroma) {
+        bool preserveLogEncoded, bool smoothChroma, const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0 || (pixelOffset & 1u)) return false;
@@ -824,12 +887,13 @@ bool NativeVideoDecoder::extractFrameIntoBytes(int frameNumber,
     bytes.resize(pixelOffset + samples * sizeof(uint16_t));
     return extractFrameInto(frameNumber,
         reinterpret_cast<uint16_t*>(bytes.data() + pixelOffset), samples,
-        width, height, preserveLogEncoded, smoothChroma);
+        width, height, preserveLogEncoded, smoothChroma, nullptr, false, false, cancelled);
 }
 
 bool NativeVideoDecoder::extractFrameIntoBytesDeferred(int frameNumber,
         std::vector<uint8_t>& bytes, size_t pixelOffset,
-        int outputWidth, int outputHeight, bool smoothChroma) {
+        int outputWidth, int outputHeight, bool smoothChroma,
+        const std::function<bool()>& cancelled) {
     const int width = outputWidth > 0 ? outputWidth : mVideoInfo.width;
     const int height = outputHeight > 0 ? outputHeight : mVideoInfo.height;
     if (width <= 0 || height <= 0 || (pixelOffset & 1u)) return false;
@@ -842,7 +906,7 @@ bool NativeVideoDecoder::extractFrameIntoBytesDeferred(int frameNumber,
     bytes.resize(pixelOffset + samples * sizeof(uint16_t));
     return extractFrameInto(frameNumber,
         reinterpret_cast<uint16_t*>(bytes.data() + pixelOffset), samples,
-        width, height, false, smoothChroma, nullptr, true);
+        width, height, false, smoothChroma, nullptr, true, false, cancelled);
 }
 
 std::shared_ptr<void> NativeVideoDecoder::pendingGpuLease() const {
@@ -873,14 +937,15 @@ bool NativeVideoDecoder::downloadPendingGpu(uint16_t* pixels, size_t samples) {
 
 bool NativeVideoDecoder::recoverFrameInSoftware(int frameNumber, uint16_t* pixels,
         size_t samples, int outputWidth, int outputHeight, bool smoothChroma,
-        const std::array<uint8_t, 4>* cfaPhase) {
+        const std::array<uint8_t, 4>* cfaPhase, const std::function<bool()>& cancelled) {
     std::lock_guard lock(mMutex);
+    if (cancelled && cancelled()) return false;
     try {
         mForceSoftwareDecoder = true;
         cleanup();
         initFFmpeg();
         return extractFrameIntoLocked(frameNumber, pixels, samples,
-            outputWidth, outputHeight, false, smoothChroma, cfaPhase, false);
+            outputWidth, outputHeight, false, smoothChroma, cfaPhase, false, false, cancelled);
     } catch (const std::exception& error) {
         spdlog::error("Native Video software recovery failed: {}", error.what());
         return false;
@@ -891,23 +956,59 @@ bool NativeVideoDecoder::extractFrameInto(int frameNumber, uint16_t* rgbData,
         size_t sampleCount, int outputWidth, int outputHeight,
         bool preserveLogEncoded, bool smoothChroma,
         const std::array<uint8_t, 4>* cfaPhase,
-        bool deferDownload, bool textureOnly) {
+        bool deferDownload, bool textureOnly, const std::function<bool()>& cancelled) {
     const auto lockStarted = rawpreamp::diagnosticNow();
     std::lock_guard<std::mutex> lock(mMutex);
     if (nativeVideoDiagnosticsEnabled())
         spdlog::info("Native Video diagnostic: frame={} decoder_lock_wait_ms={:.3f}",
                      frameNumber, elapsedMilliseconds(lockStarted));
+    bool skippedTarget = false;
+#ifdef __ANDROID__
+    int decodeError = 0;
+    int* const reportedError = &decodeError;
+#else
+    int* const reportedError = nullptr;
+#endif
     bool result = extractFrameIntoLocked(frameNumber, rgbData, sampleCount, outputWidth,
                                   outputHeight, preserveLogEncoded, smoothChroma,
-                                  cfaPhase, deferDownload, textureOnly);
+                                  cfaPhase, deferDownload, textureOnly, cancelled, &skippedTarget,
+                                  reportedError);
 #ifdef __ANDROID__
-    if (!result && mMediaCodecSurfaceActive) {
-        spdlog::warn("MediaCodec Vulkan interop failed; retrying frame through YUV fallback");
+    while (!result && !(cancelled && cancelled())) {
+        const bool mediaCodec = mCodec && mCodec->wrapper_name &&
+            std::strcmp(mCodec->wrapper_name, "mediacodec") == 0;
+        if (!mediaCodec) {
+            if (decodeError < 0)
+                spdlog::error("Native Video frame {} decode failed: {}", frameNumber,
+                             ffmpegErrorString(decodeError));
+            break;
+        }
+        if (skippedTarget && cancelled) {
+            // Save the frame already delivered for the next playback timestamp.
+            mPreviewFrameBuffered = true;
+            mSeekRequired = false;
+            throw PreviewFrameSkipped{};
+        }
+        if (decodeError < 0) {
+            spdlog::warn("MediaCodec could not decode Native Video frame {} ({}); retrying in software",
+                         frameNumber, ffmpegErrorString(decodeError));
+            mForceSoftwareDecoder = true;
+        } else if (skippedTarget) {
+            spdlog::warn("MediaCodec skipped Native Video frame {}; retrying in software", frameNumber);
+            mForceSoftwareDecoder = true;
+        } else if (mMediaCodecSurfaceActive) {
+            spdlog::warn("MediaCodec Vulkan interop failed; retrying frame through YUV fallback");
+        } else {
+            break;
+        }
         mMediaCodecSurfaceRejected = true;
         cleanup();
         initFFmpeg();
+        skippedTarget = false;
+        decodeError = 0;
         result = extractFrameIntoLocked(frameNumber, rgbData, sampleCount, outputWidth,
-            outputHeight, preserveLogEncoded, smoothChroma, cfaPhase, deferDownload, textureOnly);
+            outputHeight, preserveLogEncoded, smoothChroma, cfaPhase, deferDownload, textureOnly,
+            cancelled, &skippedTarget, &decodeError);
     }
 #endif
     return result;
@@ -917,11 +1018,20 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
         size_t sampleCount, int outputWidth, int outputHeight,
         bool preserveLogEncoded, bool smoothChroma,
         const std::array<uint8_t, 4>* cfaPhase,
-        bool deferDownload, bool textureOnly) {
+        bool deferDownload, bool textureOnly, const std::function<bool()>& cancelled,
+        bool* skippedTarget, int* decodeError) {
     const bool diagnostics = nativeVideoDiagnosticsEnabled();
     const auto extractStart = rawpreamp::diagnosticNow();
 
-    if (frameNumber < 0 || frameNumber >= static_cast<int>(mFrames.size())) {
+    const auto shouldCancel = [&] {
+        if (!cancelled || !cancelled()) return false;
+        // The demuxer may already have advanced past the requested frame.
+        mLastDecodedFrame = -1;
+        mSeekRequired = true;
+        mPreviewFrameBuffered = false;
+        return true;
+    };
+    if (frameNumber < 0 || frameNumber >= static_cast<int>(mFrames.size()) || shouldCancel()) {
         return false;
     }
     initDecoder();
@@ -1043,7 +1153,8 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
     // The caller can request the same source frame again after changing DNG
     // output settings. The decoded AVFrame remains valid until the next receive
     // or decoder reset, so avoid seeking and decoding its GOP again.
-    if (frameNumber == mLastDecodedFrame &&
+    if (!mSeekRequired && (frameNumber == mLastDecodedFrame ||
+         (mPreviewFrameBuffered && frameNumber > mLastDecodedFrame)) &&
         mFrame && mFrame->buf[0]) {
         int64_t decodedPts = mFrame->best_effort_timestamp;
         if (decodedPts == AV_NOPTS_VALUE) decodedPts = mFrame->pts;
@@ -1051,11 +1162,18 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
             if (diagnostics)
                 spdlog::info("Native Video diagnostic: frame={} decoder begin mode=current pts={}",
                              frameNumber, frameInfo.pts);
-            return convertDecoded(mFrame, false);
+            const bool advanceDecoder = std::exchange(mPreviewFrameBuffered, false);
+            return convertDecoded(mFrame, advanceDecoder);
+        }
+        if (mPreviewFrameBuffered && decodedPts != AV_NOPTS_VALUE &&
+            decodedPts > frameInfo.pts) {
+            if (skippedTarget) *skippedTarget = true;
+            return false;
         }
     }
+    mPreviewFrameBuffered = false;
     for (auto it = mDecodedFrameCache.begin();
-         cacheEnabled && it != mDecodedFrameCache.end(); ++it) {
+         !mSeekRequired && cacheEnabled && it != mDecodedFrameCache.end(); ++it) {
         if (it->first != frameInfo.pts) continue;
         if (diagnostics)
             spdlog::info("Native Video diagnostic: frame={} decoder begin mode=cache pts={}",
@@ -1098,9 +1216,9 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
     // when the caller skips more than a handful of displayed frames.
     const int forwardDistance = frameNumber - mLastDecodedFrame;
     const int seekDistance = frameNumber - precedingKeyFrame;
-    const bool sequential = forwardDistance == 1 ||
+    const bool sequential = !mSeekRequired && (forwardDistance == 1 ||
         (mLastDecodedFrame >= precedingKeyFrame && forwardDistance > 0 &&
-         forwardDistance <= seekDistance);
+         forwardDistance <= seekDistance));
     if (diagnostics)
         spdlog::info("Native Video diagnostic: frame={} decoder begin mode={} pts={}",
                      frameNumber, sequential ? "sequential" : "seek", frameInfo.pts);
@@ -1118,6 +1236,8 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
         }
 #endif
         av_frame_unref(mFrame);
+        av_packet_unref(mPacket);
+        mPacketPending = false;
         for (auto& cached : mDecodedFrameCache)
             av_frame_free(&cached.second);
         mDecodedFrameCache.clear();
@@ -1128,9 +1248,11 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
                           AVSEEK_FLAG_BACKWARD) < 0) {
             spdlog::error("Failed to seek to frame {}", frameNumber);
             mLastDecodedFrame = -1;
+            mSeekRequired = true;
             return false;
         }
         avcodec_flush_buffers(mCodecContext);
+        mSeekRequired = false;
         if (diagnostics)
             spdlog::info("Native Video diagnostic: frame={} seek+flush complete elapsed_ms={:.3f}",
                          frameNumber, elapsedMilliseconds(extractStart));
@@ -1140,7 +1262,8 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
     size_t framesDecoded = 0;
     auto receiveTarget = [&]() -> int {
         int receiveResult = 0;
-        while ((receiveResult = avcodec_receive_frame(mCodecContext, mFrame)) == 0) {
+        while (!shouldCancel() && (receiveResult = avcodec_receive_frame(mCodecContext, mFrame)) == 0) {
+            if (shouldCancel()) return -1;
             ++framesDecoded;
             int64_t decodedPts = mFrame->best_effort_timestamp;
             if (decodedPts == AV_NOPTS_VALUE) decodedPts = mFrame->pts;
@@ -1154,14 +1277,22 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
             // Decoder output is in presentation order. Once it has passed the
             // requested PTS, continuing to EOF cannot find the target and can
             // make a malformed or unusual timeline look like a hung read.
-            if (decodedPts != AV_NOPTS_VALUE && decodedPts > frameInfo.pts)
+            if (decodedPts != AV_NOPTS_VALUE && decodedPts > frameInfo.pts) {
+                if (skippedTarget) *skippedTarget = true;
+                mSeekRequired = true;
+                if (diagnostics)
+                    spdlog::info("Native Video diagnostic: frame={} decoder passed target pts={} decoded_pts={}",
+                                 frameNumber, frameInfo.pts, decodedPts);
                 return -1;
+            }
             cacheSkippedFrame(decodedPts);
             if (mMediaCodecSurfaceActive) av_frame_unref(mFrame);
         }
+        if (shouldCancel()) return -1;
         if (receiveResult != AVERROR(EAGAIN) && receiveResult != AVERROR_EOF) {
-            spdlog::error("Native Video frame {} receive failed: {}",
-                          frameNumber, ffmpegErrorString(receiveResult));
+            if (decodeError) *decodeError = receiveResult;
+            else spdlog::error("Native Video frame {} receive failed: {}",
+                               frameNumber, ffmpegErrorString(receiveResult));
             mLastDecodedFrame = -1;
             return -1;
         }
@@ -1175,46 +1306,51 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
 
     int readResult = 0;
     while (true) {
-        readResult = av_read_frame(mFormatContext, mPacket);
-        if (readResult < 0) break;
-        ++packetsRead;
-        if (mPacket->stream_index == mVideoStreamIndex) {
-            int sendResult = avcodec_send_packet(mCodecContext, mPacket);
-            if (sendResult == AVERROR(EAGAIN)) {
-                const int received = receiveTarget();
-                if (received != 0) {
-                    av_packet_unref(mPacket);
-                    return received > 0;
-                }
-                sendResult = avcodec_send_packet(mCodecContext, mPacket);
-            }
-            if (sendResult == 0) {
-                const int received = receiveTarget();
-                if (received != 0) {
-                    av_packet_unref(mPacket);
-                    return received > 0;
-                }
-            }
-            if (sendResult < 0 && sendResult != AVERROR(EAGAIN)) {
-                spdlog::error("Native Video frame {} packet submit failed: {}",
-                              frameNumber, ffmpegErrorString(sendResult));
+        if (shouldCancel()) return false;
+        if (!mPacketPending) {
+            readResult = av_read_frame(mFormatContext, mPacket);
+            if (readResult < 0) break;
+            ++packetsRead;
+            if (mPacket->stream_index != mVideoStreamIndex) {
                 av_packet_unref(mPacket);
-                mLastDecodedFrame = -1;
-                if (sendResult == AVERROR(ENOMEM) && mHardwareDecoderActive &&
-                    !mForceSoftwareDecoder) {
-                    spdlog::warn("NativeVideoDecoder: GPU decoder ran out of memory; retrying frame {} in software",
-                                 frameNumber);
-                    mForceSoftwareDecoder = true;
-                    cleanup();
-                    initFFmpeg();
-                    return extractFrameIntoLocked(frameNumber, rgbData, sampleCount,
-                        outputWidth, outputHeight, preserveLogEncoded,
-                        smoothChroma, cfaPhase, deferDownload);
-                }
-                return false;
+                continue;
             }
+            mPacketPending = true;
+        }
+        int sendResult = avcodec_send_packet(mCodecContext, mPacket);
+        if (sendResult == AVERROR(EAGAIN)) {
+            // FFmpeg has not consumed the packet. If a queued output satisfies
+            // this request, retry the same packet on the next frame request.
+            const int received = receiveTarget();
+            if (received != 0) return received > 0;
+            sendResult = avcodec_send_packet(mCodecContext, mPacket);
         }
         av_packet_unref(mPacket);
+        mPacketPending = false;
+        if (sendResult < 0) {
+            mLastDecodedFrame = -1;
+            if ((sendResult == AVERROR(ENOMEM) || sendResult == AVERROR(ENOSYS)) &&
+                mHardwareDecoderActive &&
+                !mForceSoftwareDecoder) {
+                // A hardware decoder can open successfully and fail when
+                // FFmpeg creates its surface pool on the first packet.
+                spdlog::warn("NativeVideoDecoder: hardware decoder could not submit frame {} ({}); retrying in software",
+                             frameNumber, ffmpegErrorString(sendResult));
+                mForceSoftwareDecoder = true;
+                mGpuRgbRejected = true;
+                cleanup();
+                initFFmpeg();
+                return extractFrameIntoLocked(frameNumber, rgbData, sampleCount,
+                    outputWidth, outputHeight, preserveLogEncoded, smoothChroma,
+                    cfaPhase, deferDownload, textureOnly, cancelled);
+            }
+            if (decodeError) *decodeError = sendResult;
+            else spdlog::error("Native Video frame {} packet submit failed: {}",
+                               frameNumber, ffmpegErrorString(sendResult));
+            return false;
+        }
+        const int received = receiveTarget();
+        if (received != 0) return received > 0;
     }
 
     if (readResult != AVERROR_EOF) {
@@ -1223,29 +1359,26 @@ bool NativeVideoDecoder::extractFrameIntoLocked(int frameNumber, uint16_t* rgbDa
         mLastDecodedFrame = -1;
         return false;
     }
+    if (shouldCancel()) return false;
     // Drain delayed frames after the demuxer reaches EOF.
     const int drainResult = avcodec_send_packet(mCodecContext, nullptr);
     if (drainResult < 0 && drainResult != AVERROR_EOF) {
-        spdlog::error("Native Video frame {} drain failed: {}",
-                      frameNumber, ffmpegErrorString(drainResult));
+        if (decodeError) *decodeError = drainResult;
+        else spdlog::error("Native Video frame {} drain failed: {}",
+                           frameNumber, ffmpegErrorString(drainResult));
         mLastDecodedFrame = -1;
         return false;
     }
-    int receiveResult = 0;
-    while ((receiveResult = avcodec_receive_frame(mCodecContext, mFrame)) == 0) {
-        ++framesDecoded;
-        int64_t decodedPts = mFrame->best_effort_timestamp;
-        if (decodedPts == AV_NOPTS_VALUE) decodedPts = mFrame->pts;
-        if (decodedPts == frameInfo.pts) {
-            return convertDecoded(mFrame, true);
-        }
-        if (decodedPts != AV_NOPTS_VALUE && decodedPts > frameInfo.pts) break;
-        cacheSkippedFrame(decodedPts);
-    }
-    if (receiveResult != AVERROR_EOF && receiveResult != AVERROR(EAGAIN))
-        spdlog::error("Native Video frame {} drain receive failed: {}",
-                      frameNumber, ffmpegErrorString(receiveResult));
-
+    const int received = receiveTarget();
+    if (received != 0) return received > 0;
+    if (shouldCancel()) return false;
+#ifdef __ANDROID__
+    // MediaCodec can silently drain without producing a frame for an
+    // unsupported profile. Let the caller retry with a software decoder.
+    if (decodeError && mCodec->wrapper_name &&
+        std::strcmp(mCodec->wrapper_name, "mediacodec") == 0)
+        *decodeError = AVERROR_EOF;
+#endif
     mLastDecodedFrame = -1;
     return false;
 }
@@ -1324,6 +1457,17 @@ bool NativeVideoDecoder::initHardwareDecoder() {
                         releaseHardwareDevice(&device);
                         continue;
                     }
+#ifdef VK_KHR_video_decode_h265
+                    // FFmpeg's coincident DPB path submits separate images.
+                    // Use another hardware backend if this profile requires
+                    // all its reference slots to be layers of a single image.
+                    if (vulkanDecodeRequiresLayeredReferences(
+                            *vulkan, *mFormatContext->streams[mVideoStreamIndex]->codecpar)) {
+                        spdlog::info("NativeVideoDecoder: Vulkan decode profile requires layered references; selecting another backend");
+                        releaseHardwareDevice(&device);
+                        continue;
+                    }
+#endif
                 }
             }
 #endif
@@ -1516,11 +1660,20 @@ bool NativeVideoDecoder::convertVulkanYUVToRGB(AVFrame* frame, uint16_t* rgbData
     return false;
 #else
     const char* enabled = rawpreamp::debugEnvironment("RAWPREAMP_NATIVE_VIDEO_GPU_RGB");
-    if ((enabled && enabled[0] == '0') || mGpuRgbRejected || !rgbData)
+    // CUDA already scales card thumbnails. Converting the small software
+    // frame avoids creating another Vulkan device during concurrent imports.
+    if ((enabled && enabled[0] == '0') || mGpuRgbRejected || !rgbData ||
+        (mThumbnailPreview && mHardwarePixelFormat == AV_PIX_FMT_CUDA))
         return false;
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+    const bool cudaFrame = frame->format == AV_PIX_FMT_CUDA && frame->hw_frames_ctx;
+    if (cudaFrame && mCudaVulkanRejected) return false;
+#else
+    constexpr bool cudaFrame = false;
+#endif
     const bool vulkanFrame = frame->format == AV_PIX_FMT_VULKAN &&
         frame->hw_frames_ctx;
-    if (vulkanFrame) {
+    if (vulkanFrame || cudaFrame) {
         const auto* frames = reinterpret_cast<const AVHWFramesContext*>(
             frame->hw_frames_ctx->data);
         if (!frames || (frames->sw_format != AV_PIX_FMT_P010LE &&
@@ -1545,6 +1698,14 @@ bool NativeVideoDecoder::convertVulkanYUVToRGB(AVFrame* frame, uint16_t* rgbData
             : NativeVideoGpuRgb::TransferCurve::None;
     if (!mDirectGpuRgb->render(frame, width, height, smoothChroma, curve,
                                fullRange, rgbData, cfaPhase, deferDownload)) {
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+        if (cudaFrame) {
+            spdlog::info("Native Video CUDA-to-Vulkan sharing unavailable; using host transfer");
+            mCudaVulkanRejected = true;
+            mDirectGpuRgb.reset();
+            return false;
+        }
+#endif
         spdlog::warn("Native Video direct GPU RGB conversion failed; using CPU conversion");
         mDirectGpuRgb.reset();
         mGpuRgbRejected = true;
@@ -2036,6 +2197,9 @@ void NativeVideoDecoder::cleanup() {
     mMediaCodecSurfaceActive = false;
     mHardwarePixelFormat = AV_PIX_FMT_NONE;
     mLastDecodedFrame = -1;
+    mPacketPending = false;
+    mSeekRequired = false;
+    mPreviewFrameBuffered = false;
     mReportedFrameFormat = AV_PIX_FMT_NONE;
 }
 

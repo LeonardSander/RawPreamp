@@ -1,4 +1,5 @@
 #include "VulkanResidentImage.h"
+#include "SharedVulkanDevice.h"
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
 #include "VulkanJpegContext.h"
 #include <libplacebo/gpu.h>
@@ -75,7 +76,8 @@ static bool reduceResidentImage(const VulkanResidentImage& source,
     auto& context = jpegContext();
     std::lock_guard lock(context.mutex);
     if (!context.init() || source.gpu != context.vulkan->gpu) return false;
-    static ReductionState s;
+    static VulkanProcessState<ReductionState> reduction;
+    auto& s = reduction.get();
     if (!s.gpu) {
         s.gpu = context.vulkan->gpu;
         s.deviceLease = jpegContextLease();

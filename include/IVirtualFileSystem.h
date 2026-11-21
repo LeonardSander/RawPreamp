@@ -39,7 +39,8 @@ public:
         bool jpegCompression = false, bool savedOutput = false,
         bool deferCompression = false) = 0;
     virtual bool materializePreviewFrame(const Entry&, PreviewFrame&,
-                                         bool retainSourceSamples = false) = 0;
+                                         bool retainSourceSamples = false,
+                                         const std::function<bool()>& cancelled = {}) = 0;
 
     virtual void updateOptions(const RenderSettings& settings) = 0;
     virtual FileInfo getFileInfo() const = 0;

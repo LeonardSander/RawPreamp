@@ -10856,10 +10856,14 @@ bool DNGDecoder::cropGainMapsToFullSensor(
     size_t mappedCount = 0;
     for (const TiffEntry* opcode : opcodes) {
       if (!opcode || !opcode->count) continue;
+      std::vector<std::pair<size_t, size_t>> payloads;
+      if (!locateGainMapPayloads(data.data() + opcode->valueOffset,
+                                 opcode->count, payloads))
+          return false;
+      if (payloads.empty()) continue;
       std::vector<GainMap> maps;
       if (!parseOpcodeGainMaps(data.data() + opcode->valueOffset, opcode->count, maps))
           return false;
-      if (maps.empty()) continue;
       for (auto& map : maps) {
         // Some legacy gain maps use 1/pointCount instead of
         // 1/(pointCount-1), leaving the final row/column short of the sensor
@@ -10908,10 +10912,7 @@ bool DNGDecoder::cropGainMapsToFullSensor(
         map.spacingV = map.height > 1 ? 1.0 / (map.height - 1) : 1.0;
       }
 
-      std::vector<std::pair<size_t, size_t>> payloads;
-      if (!locateGainMapPayloads(data.data() + opcode->valueOffset,
-                                 opcode->count, payloads) ||
-          !overwriteGainMapPayloads(data, opcode->valueOffset, payloads, maps))
+      if (!overwriteGainMapPayloads(data, opcode->valueOffset, payloads, maps))
           return false;
       mappedCount += maps.size();
     }

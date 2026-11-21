@@ -2,10 +2,73 @@
 
 #include "DebugInstrumentation.h"
 
+#include <mutex>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace rawpreamp {
+
+// Release caches after the application joins its workers, while the Vulkan
+// loader and validation layer still own their process-global dispatch state.
+class VulkanProcessResources {
+public:
+    using Release = void (*)(void*);
+
+    static void add(Release release, void* resource) {
+        auto& registry = instance();
+        std::lock_guard lock(registry.mutex);
+        registry.resources.emplace_back(release, resource);
+    }
+
+    ~VulkanProcessResources() {
+        std::vector<std::pair<Release, void*>> resources;
+        auto& registry = instance();
+        {
+            std::lock_guard lock(registry.mutex);
+            resources.swap(registry.resources);
+        }
+        for (auto it = resources.rbegin(); it != resources.rend(); ++it)
+            it->first(it->second);
+    }
+
+private:
+    struct Registry {
+        std::mutex mutex;
+        std::vector<std::pair<Release, void*>> resources;
+    };
+
+    static Registry& instance() {
+        static Registry registry;
+        return registry;
+    }
+};
+
+template<class T>
+class VulkanProcessState {
+public:
+    template<class... Args>
+    explicit VulkanProcessState(Args&&... args)
+        : value(std::in_place, std::forward<Args>(args)...) {
+        VulkanProcessResources::add([](void* resource) {
+            static_cast<VulkanProcessState*>(resource)->value.reset();
+        }, this);
+    }
+
+    T& get() { return *value; }
+
+private:
+    std::optional<T> value;
+};
+
+}
+
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
 #include <libplacebo/vulkan.h>
 #include "VulkanDevicePolicy.h"
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <spdlog/spdlog.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -76,6 +139,9 @@ inline pl_vulkan sharedVulkanDevice() {
         // Window-system extensions belong to the platform adapter, not to
         // unified-memory or image-sharing policy. Enable those available.
         static constexpr const char* surfaceExtensions[] = {
+            "VK_KHR_get_surface_capabilities2",
+            "VK_EXT_surface_maintenance1",
+            "VK_KHR_surface_maintenance1",
 #ifdef __ANDROID__
             "VK_KHR_android_surface"
 #elif defined(__APPLE__)
@@ -167,6 +233,42 @@ inline bool vulkanNeedsFenceCompletion(pl_vulkan device) {
     properties.pNext = &driver;
     getProperties(device->phys_device, &properties);
     return driver.driverID == VK_DRIVER_ID_MOLTENVK;
+}
+
+inline bool vulkanDeviceMemoryFits(pl_vulkan device, size_t bytes) {
+    if (!device) return true;
+    const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        device->get_proc_addr(device->instance, "vkEnumerateDeviceExtensionProperties"));
+    const auto getProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        device->get_proc_addr(device->instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    uint32_t count = 0;
+    if (!enumerate || !getProperties ||
+        enumerate(device->phys_device, nullptr, &count, nullptr) != VK_SUCCESS || !count)
+        return true;
+    std::vector<VkExtensionProperties> extensions(count);
+    if (enumerate(device->phys_device, nullptr, &count, extensions.data()) != VK_SUCCESS ||
+        std::none_of(extensions.begin(), extensions.end(), [](const auto& extension) {
+            return std::strcmp(extension.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+        }))
+        return true;
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    properties.pNext = &budget;
+    getProperties(device->phys_device, &properties);
+    // A small host-visible BAR heap cannot substitute for the primary VRAM heap.
+    uint32_t primary = VK_MAX_MEMORY_HEAPS;
+    for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+        const auto& heap = properties.memoryProperties.memoryHeaps[i];
+        if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            (primary == VK_MAX_MEMORY_HEAPS ||
+             heap.size > properties.memoryProperties.memoryHeaps[primary].size))
+            primary = i;
+    }
+    return primary == VK_MAX_MEMORY_HEAPS || (budget.heapBudget[primary] > budget.heapUsage[primary] &&
+        bytes <= budget.heapBudget[primary] - budget.heapUsage[primary]);
 }
 
 inline pl_vulkan createGalleryVulkanContext(pl_log log) {

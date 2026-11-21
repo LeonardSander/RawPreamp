@@ -1,4 +1,5 @@
 #include "DebugInstrumentation.h"
+#include "SharedVulkanDevice.h"
 #include "VulkanJpegEntropy.h"
 
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
@@ -206,7 +207,10 @@ struct State {
     }
 
 };
-State& state() { static State value; return value; }
+State& state() {
+    static VulkanProcessState<State> value;
+    return value.get();
+}
 
 bool stuffJoined(const std::vector<uint32_t>& joined, size_t rawBytes,
                  uint8_t* output, int capacity, int* written) {

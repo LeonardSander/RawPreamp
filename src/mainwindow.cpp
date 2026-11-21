@@ -3911,10 +3911,10 @@ rawpreamp::RenderSettings MainWindow::settingsForMount(rawpreamp::MountId mountI
 
 void MainWindow::startGalleryRender(rawpreamp::MountId mountId, double startSeconds,
                                     bool backfillThumbnails) {
+    if (!mClipPlayer || mClipPlayer->isClosing()) return;
     auto settings = previewRenderSettings(settingsForMount(mountId));
     const auto info = mFuseFilesystem->getFileInfo(mountId);
     if (!info) return;
-    if (!mClipPlayer) return;
     // Gallery output follows the user's render settings. In particular, full
     // resolution remains the default and only the explicit proxy/draft option
     // reduces source resolution for faster playback.
@@ -3979,6 +3979,7 @@ void MainWindow::startGalleryRender(rawpreamp::MountId mountId, double startSeco
             options.firstFrame = firstFrame;
             options.clippingEnabled = clippingEnabled;
             options.retainSourceSamples = histogramEnabled;
+            options.cancelled = [this, generation] { return mGalleryGeneration.load() != generation; };
             options.skipFrame = [playbackTarget,incomingFrame,backfillThumbnails](size_t frame) {
                 if(backfillThumbnails){
                     incomingFrame->store(static_cast<int>(frame));return false;
@@ -4019,6 +4020,7 @@ void MainWindow::startGalleryRender(rawpreamp::MountId mountId, double startSeco
                         rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GALLERY_REQUIRE_ZERO_COPY");
                     gpuOutput.width = preview.width;
                     gpuOutput.height = preview.height;
+                    gpuOutput.staticFrame = !isSequence;
                     // Direct presentation can use the GPU's rotated RGB24
                     // rows directly. FFmpeg expects source-oriented rows and
                     // performs its own rotation in the video filter graph.

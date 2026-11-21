@@ -1060,7 +1060,22 @@ GalleryVulkanVideo::GalleryVulkanVideo(QWidget* parent) : QWidget(parent) {
             spdlog::warn("Gallery Vulkan validation layer unavailable");
     }
 #endif
-    mInstance->setApiVersion(QVersionNumber(1, 2));
+    if (!shared) {
+        const auto supportedVersion = mInstance->supportedApiVersion();
+        mInstance->setApiVersion(std::min(QVersionNumber(1, 3), supportedVersion));
+        const auto supportedExtensions = mInstance->supportedExtensions();
+        const QByteArray surfaceCapabilities("VK_KHR_get_surface_capabilities2");
+        if (supportedExtensions.contains(surfaceCapabilities)) {
+            auto extensions = mInstance->extensions();
+            for (const QByteArray& extension : {surfaceCapabilities,
+                    QByteArray("VK_EXT_surface_maintenance1"),
+                    QByteArray("VK_KHR_surface_maintenance1")}) {
+                if (supportedExtensions.contains(extension) && !extensions.contains(extension))
+                    extensions.append(extension);
+            }
+            mInstance->setExtensions(extensions);
+        }
+    }
     if (!mInstance->create()) {
         spdlog::warn("Gallery native Vulkan instance unavailable: {}",
             int(mInstance->errorCode()));

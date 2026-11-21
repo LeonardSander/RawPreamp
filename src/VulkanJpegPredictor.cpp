@@ -20,8 +20,9 @@
 namespace rawpreamp {
 namespace {
 std::shared_ptr<VulkanJpegContext> contextOwner() {
-    static auto context = std::make_shared<VulkanJpegContext>();
-    return context;
+    static VulkanProcessState<std::shared_ptr<VulkanJpegContext>> context(
+        std::make_shared<VulkanJpegContext>());
+    return context.get();
 }
 }
 VulkanJpegContext& jpegContext() { return *contextOwner(); }
@@ -267,7 +268,11 @@ struct State {
         return residualPass != nullptr;
     }
 };
-State& state() { static State value; return value; }
+State& state() {
+    jpegContext();
+    static VulkanProcessState<State> value;
+    return value.get();
+}
 }
 
 pl_buf jpegResidentImageVulkan(const uint16_t* pixels, uint32_t width,

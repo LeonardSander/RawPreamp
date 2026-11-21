@@ -255,7 +255,7 @@ public:
         return std::make_shared<std::vector<uint8_t>>(timed.begin(), timed.end());
     }
     bool materializePreviewFrame(const rawpreamp::Entry&, rawpreamp::PreviewFrame&,
-                                 bool = false) override {
+                                 bool, const std::function<bool()>&) override {
         return false;
     }
     bool sourceImagePayloadsEqual(const rawpreamp::Entry& left,

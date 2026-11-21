@@ -68,6 +68,7 @@ struct VulkanGalleryOutput {
     int orientation = 0;
     bool rgb24 = false;
     bool rgb10a2 = false;
+    bool staticFrame = false;
     // Diagnostic contract: resident input and shared-image presentation only.
     bool requireZeroCopy = false;
     const std::vector<uint8_t>* clipping = nullptr;

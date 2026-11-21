@@ -114,9 +114,20 @@ void PreviewRenderer::render(
         PreviewFrame frame;
         frame.sourceFrameIndex = index;
         frame.clippingRequested = options.clippingEnabled;
-        if (!state->filesystem->materializePreviewFrame(
-                entries[index], frame, options.retainSourceSamples))
+        bool materialized = false;
+        try {
+            materialized = state->filesystem->materializePreviewFrame(
+                entries[index], frame, options.retainSourceSamples, options.cancelled);
+        } catch (const PreviewFrameSkipped&) {
+            ++completed;
+            if (profileFrames)
+                spdlog::info("GALLERY_PERF event=preview_frame_skipped source={} frame={}", mSource, index);
+            continue;
+        }
+        if (!materialized) {
+            if (options.cancelled && options.cancelled()) break;
             throw std::runtime_error("Could not render preview " + entries[index].name);
+        }
         const auto materializeFinished = rawpreamp::diagnosticNow();
         // A queued GPU frame may outlive this render and a later settings
         // change. Keep the exact filesystem/decoder state that owns its GPU.

@@ -631,7 +631,8 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_DNG::materializeFile
 }
 
 bool VirtualFileSystemImpl_DNG::materializePreviewFrame(
-        const Entry& entry, PreviewFrame& preview, bool retainSourceSamples) {
+        const Entry& entry, PreviewFrame& preview, bool retainSourceSamples,
+        const std::function<bool()>&) {
     std::shared_lock renderLock(mRenderMutex);
     const auto timestamp = std::get<Timestamp>(entry.userData);
     const auto frameIt = mFrameIndexByTimestamp.find(timestamp);

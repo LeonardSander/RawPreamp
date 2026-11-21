@@ -167,7 +167,7 @@ VirtualFileSystemImpl_NativeVideo::VirtualFileSystemImpl_NativeVideo(
 
     // Initialize NativeVideoDecoder
     try {
-        mDecoder = std::make_unique<NativeVideoDecoder>(mSrcPath);
+        mDecoder = std::make_unique<NativeVideoDecoder>(mSrcPath, mConfig.thumbnailPreview);
         mDecoder->overrideTimestamps(vfs::sidecarTimestamps(
             mSidecarMetadata, mDecoder->getFrames().size()));
         if (mCalibration && mCalibration->hasDataLevels) {
@@ -948,7 +948,8 @@ VirtualFileSystemImpl_NativeVideo::processFrame(const Entry& entry, int previewS
                                                bool outputBayer,
                                                bool deferGpuDownload,
                                                bool textureOnly,
-                                               bool packedGpuDng) {
+                                               bool packedGpuDng,
+                                               const std::function<bool()>& cancelled) {
     const bool profile = rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE");
     const auto processStarted = rawpreamp::diagnosticNow();
     ProcessedFrame result;
@@ -1027,45 +1028,47 @@ VirtualFileSystemImpl_NativeVideo::processFrame(const Entry& entry, int previewS
         ? mDecoder->extractFrameBayerIntoBytes(result.frameNumber,
               result.dngStripBuffer, nativeVideoStripOffset,
               nativeVideoCfaPhase(mConfig, mCalibration),
-              result.width, result.height, keepGpuTexture)
+              result.width, result.height, keepGpuTexture, cancelled)
         : bayerOutput && textureOnly && keepGpuTexture
         ? [&] {
             const auto phase = nativeVideoCfaPhase(mConfig, mCalibration);
             return mDecoder->extractFrameTextureDeferred(result.frameNumber,
                 result.width > 0 ? result.width : mWidth,
-                result.height > 0 ? result.height : mHeight, smoothChroma, &phase);
+                result.height > 0 ? result.height : mHeight, smoothChroma, &phase, cancelled);
           }()
         : bayerOutput
         ? keepGpuTexture
             ? mDecoder->extractFrameBayerDeferred(result.frameNumber, result.rgb,
                                      nativeVideoCfaPhase(mConfig, mCalibration),
-                                     result.width, result.height)
+                                     result.width, result.height, cancelled)
             : mDecoder->extractFrameBayer(result.frameNumber, result.rgb,
                                      nativeVideoCfaPhase(mConfig, mCalibration),
-                                     result.width, result.height)
+                                     result.width, result.height, cancelled)
         : directStrip
         ? keepGpuTexture
             ? mDecoder->extractFrameIntoBytesDeferred(result.frameNumber,
               result.dngStripBuffer, nativeVideoStripOffset,
-              result.width, result.height, smoothChroma)
+              result.width, result.height, smoothChroma, cancelled)
             : mDecoder->extractFrameIntoBytes(result.frameNumber,
               result.dngStripBuffer, nativeVideoStripOffset,
-              result.width, result.height, false, smoothChroma)
+              result.width, result.height, false, smoothChroma, cancelled)
         : (textureOnly && keepGpuTexture && !outputBayer) || packedGpuStrip
             ? mDecoder->extractFrameTextureDeferred(result.frameNumber,
                 result.width > 0 ? result.width : mWidth,
-                result.height > 0 ? result.height : mHeight, smoothChroma)
+                result.height > 0 ? result.height : mHeight, smoothChroma, nullptr, cancelled)
         : keepGpuTexture
             ? mDecoder->extractFrameDeferred(result.frameNumber, result.rgb,
-                                             result.width, result.height, smoothChroma)
+                                             result.width, result.height, smoothChroma, cancelled)
             : mDecoder->extractFrame(result.frameNumber, result.rgb, result.width,
-                                     result.height, false, smoothChroma);
+                                     result.height, false, smoothChroma, cancelled);
+    if (!extractedFrame && cancelled && cancelled())
+        throw std::runtime_error("Preview rendering cancelled");
     if (!extractedFrame && packedGpuStrip)
         return processFrame(entry, previewScale, prepopulateDng, outputBayer,
-                            deferGpuDownload, textureOnly, false);
+                            deferGpuDownload, textureOnly, false, cancelled);
     if (!extractedFrame && textureOnly)
         return processFrame(entry, previewScale, prepopulateDng, outputBayer,
-                            false, false, false);
+                            false, false, false, cancelled);
     if (!extractedFrame)
         throw std::runtime_error("Could not decode Native Video frame");
     if (keepGpuTexture) {
@@ -1075,7 +1078,7 @@ VirtualFileSystemImpl_NativeVideo::processFrame(const Entry& entry, int previewS
     }
     if (packedGpuStrip && !result.gpuPending)
         return processFrame(entry, previewScale, prepopulateDng, outputBayer,
-                            deferGpuDownload, textureOnly, false);
+                            deferGpuDownload, textureOnly, false, cancelled);
     const auto extracted = rawpreamp::diagnosticNow();
     if (result.width <= 0) result.width = mWidth;
     if (result.height <= 0) result.height = mHeight;
@@ -1191,11 +1194,19 @@ VirtualFileSystemImpl_NativeVideo::staticMaterializer(const Entry& entry) {
 std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_NativeVideo::materializeFile(
     const Entry& entry, bool outputCompression, bool savedOutput,
     bool deferCompression) {
+    return materializeDng(entry, outputCompression, savedOutput, deferCompression, {});
+}
+
+std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_NativeVideo::materializeDng(
+    const Entry& entry, bool outputCompression, bool savedOutput, bool deferCompression,
+    const std::function<bool()>& cancelled) {
     const bool jpegCompression = outputCompression && !deferCompression;
     if (entry.name == "audio.wav") return mAudioWav;
     std::shared_lock renderLock(mRenderMutex);
     return vfs::materializeCached(mCache, entry, outputCompression || savedOutput, [&] {
         std::unique_lock gpuFrameLock(mGpuFrameMutex);
+        if (cancelled && cancelled())
+            throw std::runtime_error("Preview rendering cancelled");
         const auto materializeStart = rawpreamp::diagnosticNow();
         const auto& frames = mDecoder->getFrames();
         const int configuredScale = std::max(1,
@@ -1243,7 +1254,9 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_NativeVideo::materia
             logOutputBits(inputBits, mConfig.logTransform) == 8;
         auto processed = processFrame(entry, directProxy ? configuredScale : 1,
                                       prepopulateDng, outputBayer,
-                                      deferGpuDownload, false, packedGpuDng);
+                                      deferGpuDownload, false, packedGpuDng, cancelled);
+        if (cancelled && cancelled())
+            throw std::runtime_error("Preview rendering cancelled");
         const auto decodedAt = rawpreamp::diagnosticNow();
         const bool preScaledProxy = directProxy &&
             processed.width == mWidth / configuredScale &&
@@ -1317,9 +1330,9 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_NativeVideo::materia
                 !(mConfig.options & RENDER_OPT_REMOSAIC_TO_BAYER);
             gpuTexture.recoverCpu = [this, frameNumber, width = processed.width,
                     height = processed.height, bayer = processed.bayer,
-                    smoothChroma, phase](uint16_t* samples, size_t count) {
+                    smoothChroma, phase, &cancelled](uint16_t* samples, size_t count) {
                 return mDecoder->recoverFrameInSoftware(frameNumber, samples, count,
-                    width, height, smoothChroma, bayer ? &phase : nullptr);
+                    width, height, smoothChroma, bayer ? &phase : nullptr, cancelled);
             };
             pixels.textureSource = &gpuTexture;
             pixels.textureMaterialized = [&gpuFrameLock] {
@@ -1388,7 +1401,8 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_NativeVideo::materia
 }
 
 bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
-        const Entry& entry, PreviewFrame& preview, bool retainSourceSamples) {
+        const Entry& entry, PreviewFrame& preview, bool retainSourceSamples,
+        const std::function<bool()>& cancelled) {
     RenderSettings currentSettings;
     {
         std::shared_lock renderLock(mRenderMutex);
@@ -1411,8 +1425,10 @@ bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
     const bool fastBakedGallery = fastBakedGalleryCandidate &&
         mDecoder->canExtractFrameTexture() && waitVulkanGalleryPreviewReady();
     auto bakedFallback = [&]() -> bool {
+        if (cancelled && cancelled()) return false;
         try {
-            auto dng = materializeFile(entry, false);
+            auto dng = materializeDng(entry, false, false, false, cancelled);
+            if (cancelled && cancelled()) return false;
             if (dng) {
                 auto previewSettings = currentSettings;
                 previewSettings.options = static_cast<FileRenderOptions>(
@@ -1425,7 +1441,8 @@ bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
                 }
             }
         } catch (const std::exception& error) {
-            spdlog::warn("Native Video baked gallery preview failed: {}", error.what());
+            if (!(cancelled && cancelled()))
+                spdlog::warn("Native Video baked gallery preview failed: {}", error.what());
         }
         return false;
     };
@@ -1434,6 +1451,7 @@ bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
         !(currentSettings.options & RENDER_OPT_REMOSAIC_TO_BAYER)) {
         if (bakedFallback()) return true;
     }
+    if (cancelled && cancelled()) return false;
     std::shared_lock renderLock(mRenderMutex);
     try {
         const auto processStarted = rawpreamp::diagnosticNow();
@@ -1468,7 +1486,7 @@ bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
         std::unique_lock gpuFrameLock(mGpuFrameMutex);
         auto processed = processFrame(entry, directProxy ? configuredScale : 1,
                                       false, gpuBayer, textureCandidate,
-                                      fastBakedGallery || residentBayerCandidate);
+                                      fastBakedGallery || residentBayerCandidate, false, cancelled);
         const bool textureProxyReady = configuredScale == 1 ||
             (directProxy && processed.width == mWidth / configuredScale &&
              processed.height == mHeight / configuredScale);
@@ -1743,7 +1761,7 @@ bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
                     retry.clippingRequested=preview.clippingRequested;
                     gpuFrameLock.unlock();
                     renderLock.unlock();
-                    const bool ok=materializePreviewFrame(entry,retry,retainSourceSamples);
+                    const bool ok=materializePreviewFrame(entry,retry,retainSourceSamples,cancelled);
                     preview=std::move(retry);return ok;
                 }
                 preview.gallerySource.download=[source](uint16_t* dst,size_t count){
@@ -1790,6 +1808,7 @@ bool VirtualFileSystemImpl_NativeVideo::materializePreviewFrame(
                 std::chrono::duration<double, std::milli>(rawpreamp::diagnosticNow()-previewStarted).count());
         return decoded;
     } catch (const std::exception& error) {
+        if (cancelled && cancelled()) return false;
         if (fastBakedGallery) {
             spdlog::warn("Native Video fused gallery preview fell back: {}", error.what());
             renderLock.unlock();

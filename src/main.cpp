@@ -2,6 +2,7 @@
 #include "DebugInstrumentation.h"
 #include "SpatialGainValidation.h"
 #include "VulkanJpegBenchmark.h"
+#include "SharedVulkanDevice.h"
 #include "mainwindow.h"
 #include "SingleApplication.h"
 #include "NativeVideoDecoder.h"
@@ -656,6 +657,7 @@ int main(int argc, char *argv[])
         qputenv("QT_QPA_PLATFORM", waylandSession ? "wayland;xcb" : "xcb");
     }
 #endif
+    rawpreamp::VulkanProcessResources vulkanResources;
     SingleApplication app(argc, argv);
 #ifdef __ANDROID__
     QFont androidFont = app.font();

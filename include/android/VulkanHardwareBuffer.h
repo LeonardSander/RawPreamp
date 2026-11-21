@@ -12,6 +12,7 @@ class VulkanHardwareBuffer {
 public:
     using TransferCurve = NativeVideoGpuRgb::TransferCurve;
     ~VulkanHardwareBuffer();
+    bool waitForSampling() const;
     VulkanHardwareBuffer() = default;
     VulkanHardwareBuffer(const VulkanHardwareBuffer&) = delete;
     VulkanHardwareBuffer& operator=(const VulkanHardwareBuffer&) = delete;
@@ -20,6 +21,7 @@ public:
     // The output is a same-size RGBA16 UNORM storage image. Caller must wait the
     // Android acquire fence before executing this command buffer, signal a
     // release fence afterwards, and complete prior use before recording again.
+    // The output is left in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
     bool recordSampling(VkCommandBuffer command, VkImage output,
         VkImageView outputView, uint32_t queueFamily, VkImageLayout outputLayout,
         TransferCurve curve);

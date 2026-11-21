@@ -813,6 +813,16 @@ if(TARGET RawPreampPlacebo)
 else()
   message(STATUS "Vulkan GPU processing unavailable in this build; using CPU processing")
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET RawPreampPlacebo)
+  find_path(RAWPREAMP_CUDA_INCLUDE_DIR cuda.h
+    HINTS ${CUDAToolkit_ROOT} ENV CUDA_PATH /usr/local/cuda /opt/cuda
+    PATH_SUFFIXES include)
+  if(RAWPREAMP_CUDA_INCLUDE_DIR)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${RAWPREAMP_CUDA_INCLUDE_DIR})
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RAWPREAMP_HAS_CUDA_INTEROP=1)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
+  endif()
+endif()
 if(APPLE AND NATIVE_VIDEO_PLACEBO_FOUND AND NATIVE_VIDEO_PLACEBO_SAME_INSTALL AND NATIVE_VIDEO_VULKAN_INCLUDE_DIR)
   find_library(RAWPREAMP_VULKAN_LOADER NAMES vulkan
     HINTS "${RAWPREAMP_FFMPEG_LIBRARY_DIR}" "${_rawpreamp_vcpkg_prefix}/lib")

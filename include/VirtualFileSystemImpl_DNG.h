@@ -42,7 +42,8 @@ public:
         const Entry& entry, bool jpegCompression = false, bool savedOutput = false,
         bool deferCompression = false) override;
     bool materializePreviewFrame(const Entry& entry, PreviewFrame& frame,
-                                 bool retainSourceSamples = false) override;
+                                 bool retainSourceSamples = false,
+                                 const std::function<bool()>& cancelled = {}) override;
 
 private:
     enum class PayloadComparison { Same, Different, Unavailable };

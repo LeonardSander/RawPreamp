@@ -1,4 +1,5 @@
 #include "DebugInstrumentation.h"
+#include "SharedVulkanDevice.h"
 #include "VulkanJpegFullEncode.h"
 
 #ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
@@ -1188,8 +1189,8 @@ struct State {
   }
 };
 State &state() {
-  static State value;
-  return value;
+  static VulkanProcessState<State> value;
+  return value.get();
 }
 
 struct ExternalStates {
@@ -1199,8 +1200,8 @@ struct ExternalStates {
   std::unordered_map<pl_gpu, std::unique_ptr<State>> states;
 };
 ExternalStates &externalStates() {
-  static ExternalStates value;
-  return value;
+  static VulkanProcessState<ExternalStates> value;
+  return value.get();
 }
 
 bool encodeOnGpu(pl_gpu gpu, State &s, const uint16_t *pixels, pl_tex texture,

@@ -55,7 +55,7 @@ struct NativeVideoVideoInfo {
 
 class NativeVideoDecoder {
 public:
-    NativeVideoDecoder(const std::string& filePath);
+    explicit NativeVideoDecoder(const std::string& filePath, bool thumbnailPreview = false);
     ~NativeVideoDecoder();
 
     const NativeVideoVideoInfo& getVideoInfo() const { return mVideoInfo; }
@@ -65,40 +65,46 @@ public:
     bool extractFrame(int frameNumber, std::vector<uint16_t>& rgbData,
                       int outputWidth = 0, int outputHeight = 0,
                       bool preserveLogEncoded = false,
-                      bool smoothChroma = true);
+                      bool smoothChroma = true,
+                      const std::function<bool()>& cancelled = {});
     bool extractFrameDeferred(int frameNumber, std::vector<uint16_t>& rgbData,
                               int outputWidth, int outputHeight,
-                              bool smoothChroma);
+                              bool smoothChroma,
+                              const std::function<bool()>& cancelled = {});
     bool extractFrameTextureDeferred(int frameNumber, int outputWidth,
                                      int outputHeight, bool smoothChroma,
-                                     const std::array<uint8_t, 4>* cfaPhase = nullptr);
+                                     const std::array<uint8_t, 4>* cfaPhase = nullptr,
+                                     const std::function<bool()>& cancelled = {});
     bool canExtractFrameTexture();
     bool extractFrameBayer(int frameNumber, std::vector<uint16_t>& bayerData,
                            const std::array<uint8_t, 4>& cfaPhase,
-                           int outputWidth = 0, int outputHeight = 0);
+                           int outputWidth = 0, int outputHeight = 0,
+                           const std::function<bool()>& cancelled = {});
     bool extractFrameBayerDeferred(int frameNumber, std::vector<uint16_t>& bayerData,
                                    const std::array<uint8_t, 4>& cfaPhase,
-                                   int outputWidth = 0, int outputHeight = 0);
+                                   int outputWidth = 0, int outputHeight = 0,
+                                   const std::function<bool()>& cancelled = {});
     bool extractFrameBayerIntoBytes(int frameNumber, std::vector<uint8_t>& bytes,
                                    size_t pixelOffset,
                                    const std::array<uint8_t, 4>& cfaPhase,
                                    int outputWidth, int outputHeight,
-                                   bool deferDownload);
+                                   bool deferDownload, const std::function<bool()>& cancelled = {});
     bool extractFrameIntoBytes(int frameNumber, std::vector<uint8_t>& bytes,
                                size_t pixelOffset, int outputWidth = 0,
                                int outputHeight = 0,
                                bool preserveLogEncoded = false,
-                               bool smoothChroma = true);
+                               bool smoothChroma = true, const std::function<bool()>& cancelled = {});
     bool extractFrameIntoBytesDeferred(int frameNumber,
                                std::vector<uint8_t>& bytes, size_t pixelOffset,
                                int outputWidth, int outputHeight,
-                               bool smoothChroma);
+                               bool smoothChroma, const std::function<bool()>& cancelled = {});
     bool pendingGpuTexture(const void*& gpu, const void*& texture) const;
     std::shared_ptr<void> pendingGpuLease() const;
     bool downloadPendingGpu(uint16_t* pixels, size_t samples);
     bool recoverFrameInSoftware(int frameNumber, uint16_t* pixels, size_t samples,
                                 int outputWidth, int outputHeight, bool smoothChroma,
-                                const std::array<uint8_t, 4>* cfaPhase);
+                                const std::array<uint8_t, 4>* cfaPhase,
+                                const std::function<bool()>& cancelled = {});
     void setFullRangeOverride(std::optional<bool> fullRange);
     
     static bool isHLGVideo(const std::string& filePath);
@@ -116,12 +122,16 @@ private:
                           int outputWidth, int outputHeight,
                           bool preserveLogEncoded, bool smoothChroma,
                           const std::array<uint8_t, 4>* cfaPhase = nullptr,
-                          bool deferDownload = false, bool textureOnly = false);
+                          bool deferDownload = false, bool textureOnly = false,
+                          const std::function<bool()>& cancelled = {});
     bool extractFrameIntoLocked(int frameNumber, uint16_t* rgbData, size_t sampleCount,
                                 int outputWidth, int outputHeight,
                                 bool preserveLogEncoded, bool smoothChroma,
                                 const std::array<uint8_t, 4>* cfaPhase,
-                                bool deferDownload, bool textureOnly = false);
+                                bool deferDownload, bool textureOnly = false,
+                                const std::function<bool()>& cancelled = {},
+                                bool* skippedTarget = nullptr,
+                                int* decodeError = nullptr);
     bool convertYUVToRGB(AVFrame* yuvFrame, uint16_t* rgbData, size_t sampleCount,
                          int outputWidth, int outputHeight, bool preserveLogEncoded,
                          bool smoothChroma);
@@ -142,6 +152,7 @@ private:
 
 private:
     std::string mFilePath;
+    const bool mThumbnailPreview;
     NativeVideoVideoInfo mVideoInfo;
     std::vector<NativeVideoFrameInfo> mFrames;
     
@@ -151,6 +162,12 @@ private:
     AVFrame* mFrame;
     AVFrame* mTransferFrame;
     AVPacket* mPacket;
+#ifdef RAWPREAMP_HAS_CUDA_INTEROP
+    bool mCudaVulkanRejected = false;
+#endif
+    bool mPacketPending = false;
+    bool mSeekRequired = false;
+    bool mPreviewFrameBuffered = false;
     SwsContext* mSwsContext;
 #ifdef RAWPREAMP_HAS_AVFILTER
     AVFilterGraph* mProxyGpuGraph = nullptr;

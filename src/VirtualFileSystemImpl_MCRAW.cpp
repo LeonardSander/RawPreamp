@@ -1083,7 +1083,8 @@ std::shared_ptr<std::vector<uint8_t>> VirtualFileSystemImpl_MCRAW::materializeFi
 }
 
 bool VirtualFileSystemImpl_MCRAW::materializePreviewFrame(
-    const Entry& entry, PreviewFrame& preview, bool retainSourceSamples) {
+    const Entry& entry, PreviewFrame& preview, bool retainSourceSamples,
+        const std::function<bool()>&) {
     std::shared_lock renderLock(mRenderMutex);
     try {
         const auto timestamp = std::get<Timestamp>(entry.userData);
