@@ -22,6 +22,9 @@
 #include <thread>
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #endif
 
 namespace rawpreamp {
@@ -802,7 +805,12 @@ bool bakeGainVulkan(const uint16_t* source,
             const size_t workers = std::min<size_t>(8, std::max<size_t>(1,
                 bytes / (8 * 1024 * 1024)));
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#ifdef _WIN32
+            const bool useStreamingCopy =
+                IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) != 0;
+#else
             const bool useStreamingCopy = __builtin_cpu_supports("avx2");
+#endif
 #endif
             auto copyPart = [&](size_t index) {
                 const size_t begin = (bytes * index / workers) & ~size_t{63};
