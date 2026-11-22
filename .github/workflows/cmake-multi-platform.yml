@@ -359,7 +359,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # dav1d 1.5.4's stdatomic shim fails with MSVC 19.52.
+          - os: windows-2022
             platform: windows
             build_type: Release
             build_dir: build-windows
@@ -397,9 +398,9 @@ jobs:
           ~/.cache/vcpkg
           ${{ matrix.build_dir }}/
         # CMake caches contain absolute checkout paths, which change on rename.
-        key: ${{ github.repository }}-${{ runner.os }}-${{ matrix.vcpkg_triplet }}-deps-${{ hashFiles('CMakeLists.txt', 'vcpkg.json', 'scripts/vcpkg-triplets/**', '.github/workflows/**') }}
+        key: ${{ github.repository }}-${{ matrix.os }}-${{ matrix.vcpkg_triplet }}-deps-${{ hashFiles('CMakeLists.txt', 'vcpkg.json', 'scripts/vcpkg-triplets/**', '.github/workflows/**') }}
         restore-keys: |
-          ${{ github.repository }}-${{ runner.os }}-${{ matrix.vcpkg_triplet }}-deps-
+          ${{ github.repository }}-${{ matrix.os }}-${{ matrix.vcpkg_triplet }}-deps-
 
     # ---------- QT ----------
     - name: Set up Python
