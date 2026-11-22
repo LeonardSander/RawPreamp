@@ -363,7 +363,7 @@ jobs:
           - os: windows-2022
             platform: windows
             build_type: Release
-            build_dir: build-windows
+            build_dir: build-windows-clang
             vcpkg_triplet: x64-windows-release
             artifact_suffix: windows-x86_64
           - os: macos-15-intel
@@ -398,9 +398,9 @@ jobs:
           ~/.cache/vcpkg
           ${{ matrix.build_dir }}/
         # CMake caches contain absolute checkout paths, which change on rename.
-        key: ${{ github.repository }}-${{ matrix.os }}-${{ matrix.vcpkg_triplet }}-deps-${{ hashFiles('CMakeLists.txt', 'vcpkg.json', 'scripts/vcpkg-triplets/**', '.github/workflows/**') }}
+        key: ${{ github.repository }}-${{ matrix.os }}-${{ matrix.vcpkg_triplet }}-${{ matrix.build_dir }}-deps-${{ hashFiles('CMakeLists.txt', 'vcpkg.json', 'scripts/build_windows.ps1', 'scripts/vcpkg-triplets/**', '.github/workflows/**') }}
         restore-keys: |
-          ${{ github.repository }}-${{ matrix.os }}-${{ matrix.vcpkg_triplet }}-deps-
+          ${{ github.repository }}-${{ matrix.os }}-${{ matrix.vcpkg_triplet }}-${{ matrix.build_dir }}-deps-
 
     # ---------- QT ----------
     - name: Set up Python
@@ -475,7 +475,7 @@ jobs:
       run: |
         # Manifest installation reuses the restored build directory cache.
         $env:VCPKG_BINARY_SOURCES = "clear"
-        ./scripts/build_windows.ps1 -Compiler MSVC -Phase Configure `
+        ./scripts/build_windows.ps1 -Compiler Clang -UseVisualStudio2022 -Phase Configure `
           -BuildType ${{ matrix.build_type }} -BuildDirectory ${{ matrix.build_dir }} `
           -QtPath "${{ steps.qt-windows.outputs.qt-root-dir }}"
 

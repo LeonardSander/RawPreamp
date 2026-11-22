@@ -10,7 +10,8 @@ param(
     [string]$ProjectedFsLibrary = '',
     [ValidateSet('All', 'Configure', 'Build', 'Rebuild', 'PrintConfig')]
     [string]$Phase = 'All',
-    [int]$Parallel = 0
+    [int]$Parallel = 0,
+    [switch]$UseVisualStudio2022
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,7 +84,10 @@ if ($Phase -ne 'Build') {
         '-DRAWPREAMP_REQUIRE_VULKAN=ON',
         "-Dprojected-fs=$ProjectedFsLibrary"
     )
-    if ($Compiler -eq 'Clang') {
+    if ($UseVisualStudio2022) {
+        $configure += @('-G', 'Visual Studio 17 2022', '-A', 'x64')
+        if ($Compiler -eq 'Clang') { $configure += @('-T', 'ClangCL') }
+    } elseif ($Compiler -eq 'Clang') {
         if (-not (Get-Command clang-cl -ErrorAction SilentlyContinue)) {
             $llvmDirectory = "$env:ProgramFiles\LLVM\bin"
             if (Test-Path "$llvmDirectory/clang-cl.exe") { $env:PATH = "$llvmDirectory;$env:PATH" }
