@@ -84,24 +84,40 @@ if ($Phase -ne 'Build') {
         '-DRAWPREAMP_REQUIRE_VULKAN=ON',
         "-Dprojected-fs=$ProjectedFsLibrary"
     )
+    $clangCompiler = $null
     if ($UseVisualStudio2022) {
         $configure += @('-G', 'Visual Studio 17 2022', '-A', 'x64')
-        if ($Compiler -eq 'Clang') { $configure += @('-T', 'ClangCL') }
+        if ($Compiler -eq 'Clang') {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsPath = & $vswhere -latest -products '*' -version '[17.0,18.0)' `
+                -requires Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset -property installationPath
+            if ($LASTEXITCODE -ne 0 -or -not $vsPath) { throw 'Visual Studio 2022 with the ClangCL toolset was not found.' }
+            $clangCompiler = Join-Path $vsPath 'VC\Tools\Llvm\x64\bin\clang-cl.exe'
+            if (-not (Test-Path -LiteralPath $clangCompiler -PathType Leaf)) { throw "clang-cl not found at $clangCompiler." }
+            $configure += @('-T', 'ClangCL', "-DCMAKE_GENERATOR_INSTANCE=$vsPath")
+        }
     } elseif ($Compiler -eq 'Clang') {
         if (-not (Get-Command clang-cl -ErrorAction SilentlyContinue)) {
             $llvmDirectory = "$env:ProgramFiles\LLVM\bin"
             if (Test-Path "$llvmDirectory/clang-cl.exe") { $env:PATH = "$llvmDirectory;$env:PATH" }
             else { throw 'clang-cl not found. Install LLVM and use an x64 Visual Studio developer shell.' }
         }
-        $configure += @('-G', 'Ninja Multi-Config', '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl')
+        $clangCompiler = (Get-Command clang-cl -CommandType Application | Select-Object -First 1).Source
+        $configure += @('-G', 'Ninja Multi-Config', "-DCMAKE_C_COMPILER=$clangCompiler", "-DCMAKE_CXX_COMPILER=$clangCompiler")
     }
     if ($Phase -eq 'PrintConfig') {
         Write-Output 'cmake'
         $configure | Write-Output
         exit 0
     }
-    & cmake @configure
-    if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)." }
+    $previousProtobufCompiler = $env:RAWPREAMP_VCPKG_PROTOBUF_CLANG_CL
+    try {
+        $env:RAWPREAMP_VCPKG_PROTOBUF_CLANG_CL = $clangCompiler
+        & cmake @configure
+        if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)." }
+    } finally {
+        $env:RAWPREAMP_VCPKG_PROTOBUF_CLANG_CL = $previousProtobufCompiler
+    }
 }
 if ($Phase -eq 'Configure') { exit 0 }
 
