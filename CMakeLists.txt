@@ -1035,8 +1035,7 @@ if(BUILD_TESTING)
         src/VulkanResidentImage.cpp
         src/VulkanGalleryPreview.cpp
         src/DNGDecoder.cpp
-        src/HigherCFADemosaic.cpp
-        deps/motioncam-decoder/thirdparty/liblj92/lj92.c)
+        src/HigherCFADemosaic.cpp)
     # Codec overrides must remain testable in optimized standalone builds.
     # Directory definitions disable diagnostics for Release application code.
     if(MSVC)
@@ -1046,9 +1045,6 @@ if(BUILD_TESTING)
         target_compile_options(rawpreamp-lossless-jpeg-test PRIVATE
             -URAWPREAMP_DEBUG_INSTRUMENTATION -DRAWPREAMP_DEBUG_INSTRUMENTATION=1)
     endif()
-    target_include_directories(rawpreamp-lossless-jpeg-test PRIVATE
-        deps/motioncam-decoder/thirdparty
-        deps/motioncam-decoder/thirdparty/liblj92)
     target_include_directories(rawpreamp-lossless-jpeg-test PRIVATE
         include "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(rawpreamp-lossless-jpeg-test PRIVATE
@@ -1074,13 +1070,10 @@ if(BUILD_TESTING)
         src/VulkanJpegDecode.cpp
         src/VulkanResidentImage.cpp
         src/DNGDecoder.cpp
-        src/HigherCFADemosaic.cpp
-        deps/motioncam-decoder/thirdparty/liblj92/lj92.c)
-    target_include_directories(rawpreamp-jpeg-xl-test PRIVATE
-        deps/motioncam-decoder/thirdparty)
+        src/HigherCFADemosaic.cpp)
     target_include_directories(rawpreamp-jpeg-xl-test PRIVATE include)
     target_link_libraries(rawpreamp-jpeg-xl-test PRIVATE
-        ${JXL_TARGET} JPEG::JPEG Boost::filesystem Boost::regex spdlog::spdlog RawPreampZipSource)
+        ${JXL_TARGET} JPEG::JPEG Boost::filesystem Boost::regex spdlog::spdlog RawPreampZipSource motioncam-decoder)
     target_compile_definitions(rawpreamp-jpeg-xl-test PRIVATE TINY_DNG_ENABLE_JPEG_XL)
     add_test(NAME rawpreamp-jpeg-xl-test COMMAND rawpreamp-jpeg-xl-test)
 
@@ -1100,12 +1093,11 @@ if(BUILD_TESTING)
         src/VulkanResidentImage.cpp
         src/VulkanGalleryPreview.cpp
         src/DNGDecoder.cpp
-        src/HigherCFADemosaic.cpp
-        deps/motioncam-decoder/thirdparty/liblj92/lj92.c)
+        src/HigherCFADemosaic.cpp)
     target_include_directories(rawpreamp-finalize-interpolation-test PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}"
         ${bs_thread_pool_SOURCE_DIR}/include
-        include deps/motioncam-decoder/thirdparty deps/motioncam-decoder/thirdparty/liblj92)
+        include)
     target_link_libraries(rawpreamp-finalize-interpolation-test PRIVATE
         Qt${QT_VERSION_MAJOR}::Widgets ${JXL_TARGET} Boost::filesystem Boost::regex
         spdlog::spdlog motioncam-decoder RawPreampTelemetry JPEG::JPEG)
