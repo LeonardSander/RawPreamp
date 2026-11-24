@@ -14,8 +14,11 @@ if(PORT STREQUAL "protobuf")
     if(DEFINED ENV{RAWPREAMP_VCPKG_PROTOBUF_CLANG_CL})
         file(TO_CMAKE_PATH "$ENV{RAWPREAMP_VCPKG_PROTOBUF_CLANG_CL}" _rawpreamp_clang_cl)
         list(APPEND VCPKG_HASH_ADDITIONAL_FILES "${_rawpreamp_clang_cl}")
+        # Protobuf's generated version.rc has no includes. Run rc.exe directly
+        # so cmcldeps does not forward rc.exe's /c65001 option to clang-cl.
         list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS
             "-DCMAKE_C_COMPILER:FILEPATH=${_rawpreamp_clang_cl}"
-            "-DCMAKE_CXX_COMPILER:FILEPATH=${_rawpreamp_clang_cl}")
+            "-DCMAKE_CXX_COMPILER:FILEPATH=${_rawpreamp_clang_cl}"
+            "-DCMAKE_NINJA_CMCLDEPS_RC:BOOL=OFF")
     endif()
 endif()
