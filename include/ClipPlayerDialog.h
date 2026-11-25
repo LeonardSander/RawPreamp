@@ -153,6 +153,7 @@ private:
     void stopDecoder();
     void releaseGpuFrames(bool keepPresentedFrame=false);
     void captureNativeOverlay(bool submit = true);
+    bool fallbackFromNativePresenter();
     void suspendNativeBackingStore(bool suspend);
     void decoderFinished(int, QProcess::ExitStatus); void consumeOutput();
     void showNextFrame(); void advance(); QString ffmpegPath() const;

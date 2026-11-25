@@ -1046,6 +1046,7 @@ ClipPlayerDialog::ClipPlayerDialog(QVector<Clip> clips, int initialMountId, QWid
     mOverlay=new QWidget(stage);mOverlay->setStyleSheet("background:transparent;");
     mPreparingLabel=new QLabel(mVideo->text(),stage);
     mPreparingLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    mPreparingLabel->setUpdatesEnabled(false);
     mPreparingLabel->setStyleSheet("background:transparent;color:#e0e0e0;border:0;padding:0;");
     mPreparingLabel->hide();
     auto* overlayLayout=new QVBoxLayout(mOverlay);overlayLayout->setContentsMargins(10,10,10,0);
@@ -1288,6 +1289,7 @@ ClipPlayerDialog::ClipPlayerDialog(QVector<Clip> clips, int initialMountId, QWid
     });
     mNativeOverlayCaptureTimer.setInterval(nativeOverlayIntervalMs);
     connect(&mNativeOverlayCaptureTimer,&QTimer::timeout,this,[this]{
+        if(fallbackFromNativePresenter())return;
         if(!mGpuVideo||!mGpuVideo->isVisible())return;
         // Publish the captured UI with the next video frame, including
         // uncapped playback, rather than submitting an independent UI frame.
@@ -2871,7 +2873,28 @@ void ClipPlayerDialog::revealOverlay(){
     if(mHistogramExpanded||pointerOverThumbnailRow())mOverlayTimer.stop();
     else mOverlayTimer.start();
 }
+bool ClipPlayerDialog::fallbackFromNativePresenter(){
+    if(!mGpuVideo||!mGpuVideo->native()||mGpuVideo->usable())return false;
+    spdlog::warn("Gallery native Vulkan presenter failed; retrying through fallback presentation");
+    mNativeOverlayCaptureTimer.stop();
+    mNativeOverlayCapturePending=false;
+    mGpuVideo->hide();
+    mGpuVideo->disableNative();
+    mLastPresentedGpuBuffer.reset();
+    mPreparingLabel->hide();
+    suspendNativeBackingStore(false);
+    mOverlayOpacity->setEnabled(true);
+    mOverlay->setUpdatesEnabled(true);
+    mFpsLabel->setUpdatesEnabled(true);
+    revealOverlay();
+    // Restart frame delivery using host frames.
+    QTimer::singleShot(0,this,[this]{if(!mClosing)reloadCurrentClip();});
+    return true;
+}
 void ClipPlayerDialog::updateDisplayedImage(){
+    fallbackFromNativePresenter();
+    if(mLastPresentedGpuBuffer&&!nativeVulkanPresenter())
+        mLastPresentedGpuBuffer.reset();
     // The old surface remains the interactive fallback while a decoder
     // refresh is pending. Suppressing it here made all wheel/drag input appear
     // ignored until the replacement frame arrived, especially during play.
@@ -2884,17 +2907,6 @@ void ClipPlayerDialog::updateDisplayedImage(){
         mGpuVideo->setOverlay(mCapturedNativeOverlay,mCapturedNativeOverlayParts,false);
     }
     const bool fastTouchPreview=rawpreamp::touchUi()&&mTouchActive;
-#ifndef Q_OS_ANDROID
-    if (mGpuVideo && mGpuVideo->native() && !mGpuVideo->usable()) {
-        spdlog::warn("Gallery native Vulkan presenter failed; retrying through fallback presentation");
-        mGpuVideo->disableNative();
-        mNativeOverlayCaptureTimer.stop();
-        mLastPresentedGpuBuffer.reset();
-        // Restart delivery as host frames. Existing Qt Quick/Metal and label
-        // presenters remain available if native Vulkan fails after startup.
-        QTimer::singleShot(0, this, [this] { reloadCurrentClip(); });
-    }
-#endif
     auto presentPixmap=[this](const QPixmap& pixmap){
         mVideo->setPixmap(pixmap);
     };
@@ -3482,6 +3494,7 @@ void ClipPlayerDialog::showNextFrame(){
         }
         const auto displayUiStarted=rawpreamp::diagnosticNow();
         updateDisplayedImage();
+        if(!hasPresentedFrame())return;
         if(rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GALLERY_PERF_PROFILE")&&
            mDirectSequencePresentation)
             spdlog::info("GALLERY_PERF event=gallery_display_ui elapsed_ms={:.3f}",
@@ -4304,6 +4317,7 @@ void ClipPlayerDialog::presentRgb48Frame(const QByteArray& frame,int width,int h
     setDroppedCursorVisible(false);
     setDuplicateCursorVisible(false);
     updateDisplayedImage();
+    if(!hasPresentedFrame())return;
     updateTitle();
     setCurrentThumbnailFrame(0);
     mFirstFrameReady=true;

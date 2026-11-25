@@ -265,6 +265,10 @@ public:
         mImage.fill(QColor(96, 96, 96));
         mFrameSerial = 1;
         mSerial = 1;
+        mStartupRetry.setSingleShot(true);
+        mStartupRetry.setInterval(50);
+        connect(&mStartupRetry, &QTimer::timeout, this,
+                [this] { startRendererIfReady(); });
         connect(this, &QWindow::screenChanged, this, [this] {
             QTimer::singleShot(0, this, [this] { refreshPixelGeometry(); });
         });
@@ -272,6 +276,7 @@ public:
     ~GalleryVulkanSurface() override { releaseSurfaceResources(); }
 
     void releaseSurfaceResources() {
+        mStartupRetry.stop();
         stopRenderer();
         pl_swapchain_destroy(&mPreparedSwapchain);
         if (!mSharedDevice) pl_vulkan_destroy(&mPreparedVk);
@@ -305,9 +310,11 @@ public:
             mPreparedSwapchain = pl_vulkan_create_swapchain(
                 mPreparedVk, &swapchainParams);
         }
-        // Android can expose the child surface before its native window is
-        // ready for a swapchain. Keep the presenter eligible for a retry.
-#ifndef __ANDROID__
+#ifdef __ANDROID__
+        // The window can be exposed before swapchain creation succeeds.
+        // Device creation failure on a valid surface is terminal.
+        mHealthy = bool(mPreparedVk);
+#else
         mHealthy = bool(mPreparedVk && mPreparedSwapchain);
 #endif
         if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
@@ -430,7 +437,11 @@ protected:
             static_cast<QPlatformSurfaceEvent*>(event)->surfaceEventType() ==
                 QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed)
             releaseSurfaceResources();
-        if (event->type() == QEvent::Hide) stopRenderer();
+        if (event->type() == QEvent::Hide) {
+            mStartupRetry.stop();
+            mStartupRetries = 0;
+            stopRenderer();
+        }
         const bool pixelRatioChanged = event->type() == QEvent::DevicePixelRatioChange;
         const bool handled = QWindow::event(event);
         if (pixelRatioChanged) refreshPixelGeometry();
@@ -438,6 +449,8 @@ protected:
     }
     void exposeEvent(QExposeEvent*) override {
         if (!isExposed()) {
+            mStartupRetry.stop();
+            mStartupRetries = 0;
             stopRenderer();
             return;
         }
@@ -456,19 +469,29 @@ protected:
     }
 
 private:
+    void retryRendererStartup() {
+        constexpr int maxStartupRetries = 20;
+        if (!mHealthy) return;
+        if (++mStartupRetries > maxStartupRetries) {
+            mHealthy = false;
+            return;
+        }
+        mStartupRetry.start();
+    }
+
     void startRendererIfReady() {
         if (!isExposed() || width() <= 0 || height() <= 0 ||
-            mThread.joinable() || !mHealthy) return;
+            mThread.joinable() || !mHealthy || mStartupRetry.isActive()) return;
         const VkSurfaceKHR surface = QVulkanInstance::surfaceForWindow(this);
         if (!surface) {
-            QTimer::singleShot(50, this, [this] { startRendererIfReady(); });
+            retryRendererStartup();
             return;
         }
         if (surface != mPreparedSurface || !mPreparedVk ||
             !mPreparedSwapchain)
             prewarmDevice();
         if (!mPreparedVk || !mPreparedSwapchain) {
-            QTimer::singleShot(50, this, [this] { startRendererIfReady(); });
+            retryRendererStartup();
             return;
         }
         const qreal ratio = devicePixelRatio();
@@ -490,7 +513,7 @@ private:
             qWarning() << "Gallery Vulkan initial swapchain frame unavailable"
                        << "resized" << resized;
 #endif
-            QTimer::singleShot(16, this, [this] { startRendererIfReady(); });
+            retryRendererStartup();
             return;
         }
         pl_frame output{};
@@ -503,6 +526,7 @@ private:
             return;
         }
         pl_swapchain_swap_buffers(mPreparedSwapchain);
+        mStartupRetries = 0;
         if (rawpreamp::debugEnvironment("RAWPREAMP_GALLERY_PERF_PROFILE"))
             spdlog::info("GALLERY_PERF event=native_initial_grey_present");
         const VkInstance instance = vulkanInstance()->vkInstance();
@@ -1016,6 +1040,8 @@ private:
     }
 
     std::atomic_bool mHealthy{true};
+    QTimer mStartupRetry;
+    int mStartupRetries = 0;
     VkSurfaceKHR mPreparedSurface = VK_NULL_HANDLE;
     pl_log mPreparedLog = nullptr;
     pl_vulkan mPreparedVk = nullptr;

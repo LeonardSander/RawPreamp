@@ -233,7 +233,11 @@ vec3 profileTexel(uint table, uint v, uint h, uint s) {
 }
 #endif
 layout(std430, binding = 3) readonly buffer Clipping { uint words[]; } clipping;
+#ifdef GALLERY_UNIFORM_CONSTANTS
+layout(std140, binding = 8) uniform Constants {
+#else
 layout(push_constant) uniform Constants {
+#endif
     uvec4 dimensions; // pixels, output words, mode, gain-map debug
     vec4 gains; // RGB gains, exposure
     vec4 matrixRows[3];
@@ -959,6 +963,7 @@ struct ColorConstants {
     float textureInverseRange[4];
     uint32_t thumbnail[4];
 };
+static_assert(sizeof(ColorConstants) == 15 * 16);
 
 struct GalleryShaderCache {
     std::mutex ioMutex;
@@ -1079,6 +1084,8 @@ struct Device {
     pl_buf gain = nullptr, gainUpload = nullptr;
     VulkanUploadCache gainCache, profileCache;
     pl_buf emptyGain = nullptr, srgbLookup = nullptr;
+    std::array<pl_buf, 8> colorUniforms{};
+    size_t nextColorUniform = 0;
     std::array<pl_pass,8> profileTexturePasses{};
     std::array<pl_pass,2> cachedColorPasses{}, cachedColorImagePasses{};
     bool profileTextureRejected = false;
@@ -1141,6 +1148,7 @@ struct Device {
             pl_buf_destroy(gpu, &gainUpload);
             pl_buf_destroy(gpu, &emptyGain);
             pl_buf_destroy(gpu, &srgbLookup);
+            for (auto& uniform : colorUniforms) pl_buf_destroy(gpu, &uniform);
             for (auto& profile : profileTextures) pl_tex_destroy(gpu, &profile.image);
             for (auto& pass : profileTexturePasses) pl_pass_destroy(gpu, &pass);
             for (auto& pass : cachedColorPasses) pl_pass_destroy(gpu, &pass);
@@ -1264,7 +1272,7 @@ struct Device {
                             bool captureGain = false) {
         const bool sampled = textureSource || textureBayerInput;
         const bool bayerTexture = bayerTextureSource || textureBayerInput;
-        pl_desc descriptors[8] = {};
+        pl_desc descriptors[9] = {};
         descriptors[0] = {sampled ? "sourceImage" : "src",
                           sampled ? PL_DESC_SAMPLED_TEX : PL_DESC_BUF_STORAGE,
                           0, PL_DESC_ACCESS_READONLY};
@@ -1283,7 +1291,7 @@ struct Device {
         if (cachedGain || captureGain)
             descriptors[profileTextures ? 7 : 5] = {"cachedGain", PL_DESC_BUF_STORAGE, 7,
                 captureGain ? PL_DESC_ACCESS_WRITEONLY : PL_DESC_ACCESS_READONLY};
-        const std::string source = galleryColorShader(sampled, image, rgb10a2, bayerTexture,
+        std::string source = galleryColorShader(sampled, image, rgb10a2, bayerTexture,
             clipping, prepareBayer, profileTextures, field, cachedGain, captureGain);
         if (source.empty()) return nullptr;
         pl_pass_params params = {};
@@ -1291,8 +1299,40 @@ struct Device {
         params.descriptors = descriptors;
         params.num_descriptors = (profileTextures ? 7 : 5) + ((cachedGain || captureGain) ? 1 : 0);
         params.push_constants_size = sizeof(ColorConstants);
+        if (params.push_constants_size > gpu->limits.max_pushc_size) {
+            pl_buf_params buffer{};
+            buffer.size = sizeof(ColorConstants);
+            buffer.uniform = buffer.host_writable = true;
+            buffer.memory_type = PL_BUF_MEM_DEVICE;
+            for (auto& uniform : colorUniforms) {
+                if (!uniform) uniform = pl_buf_create(gpu, &buffer);
+                if (!uniform) return nullptr;
+            }
+            source.insert(source.find('\n') + 1, "#define GALLERY_UNIFORM_CONSTANTS 1\n");
+            descriptors[params.num_descriptors++] = {
+                "Constants", PL_DESC_BUF_UNIFORM, 8, PL_DESC_ACCESS_READONLY};
+            params.push_constants_size = 0;
+        }
         params.glsl_shader = source.c_str();
         return pl_pass_create(gpu, &params);
+    }
+    void runColorPass(pl_pass_run_params run) {
+        if (run.pass->params.push_constants_size) {
+            pl_pass_run(gpu, &run);
+            return;
+        }
+        std::array<pl_desc_binding, 9> bindings{};
+        const int uniformIndex = run.pass->params.num_descriptors - 1;
+        std::copy_n(run.desc_bindings, uniformIndex, bindings.begin());
+        // Rotate even on unified memory, where a device-local allocation can
+        // still be mapped and writing a buffer in use would block the CPU.
+        const pl_buf uniform = colorUniforms[nextColorUniform];
+        nextColorUniform = (nextColorUniform + 1) % colorUniforms.size();
+        pl_buf_write(gpu, uniform, 0, run.push_constants, sizeof(ColorConstants));
+        bindings[uniformIndex].object = uniform;
+        run.desc_bindings = bindings.data();
+        run.push_constants = nullptr;
+        pl_pass_run(gpu, &run);
     }
     pl_pass ensureColorImagePass(bool rgb10a2, bool textured = false, bool cachedGain = false) {
         if (textured && !profileTextureRejected) {
@@ -2220,7 +2260,7 @@ bool colorGalleryRgbVulkan(
                     captureRun.compute_groups[1] = (groups + captureRun.compute_groups[0] - 1u) / captureRun.compute_groups[0];
                     captureRun.compute_groups[2] = 1;
                     if (captureRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) return false;
-                    pl_pass_run(selected->gpu, &captureRun);
+                    selected->runColorPass(captureRun);
                     capturedThisFrame = true;
                     return true;
                 }
@@ -2241,7 +2281,7 @@ bool colorGalleryRgbVulkan(
                 fieldRun.compute_groups[1] = (fieldGroups + fieldRun.compute_groups[0] - 1u) / fieldRun.compute_groups[0];
                 fieldRun.compute_groups[2] = 1;
                 if (fieldRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) return false;
-                pl_pass_run(selected->gpu, &fieldRun);
+                selected->runColorPass(fieldRun);
                 return true;
             }, captureGains);
         // A buffer and a texture can share a field on this device. Ensure the
@@ -2267,7 +2307,7 @@ bool colorGalleryRgbVulkan(
             if (exported) pl_buf_destroy(selected->gpu, &exported);
             return false;
         }
-        if (!capturedThisFrame) pl_pass_run(selected->gpu, &prepareRun);
+        if (!capturedThisFrame) selected->runColorPass(prepareRun);
         if (cachedSpatialGain && rawpreamp::debugEnvironmentIsSet("RAWPREAMP_GAIN_FIELD_VERIFY")) {
             if (!selected->comparePreparedPass) {
                 pl_desc descriptors[] = {
@@ -2303,7 +2343,7 @@ bool colorGalleryRgbVulkan(
             referenceRun.pass = uncachedPrepare;
             referenceRun.timer = nullptr;
             referenceRun.desc_bindings = referenceBindings.data();
-            pl_pass_run(selected->gpu, &referenceRun);
+            selected->runColorPass(referenceRun);
             pl_desc_binding compareBindings[3]{};
             compareBindings[0].object = selected->preparedBayer;
             compareBindings[1].object = selected->comparePrepared;
@@ -2348,7 +2388,7 @@ bool colorGalleryRgbVulkan(
                 fieldRun.compute_groups[1] = (groups + fieldRun.compute_groups[0] - 1u) / fieldRun.compute_groups[0];
                 fieldRun.compute_groups[2] = 1;
                 if (fieldRun.compute_groups[1] > selected->gpu->limits.max_dispatch[1]) return false;
-                pl_pass_run(selected->gpu, &fieldRun);
+                selected->runColorPass(fieldRun);
                 return true;
             });
         if (field) {
@@ -2373,7 +2413,7 @@ bool colorGalleryRgbVulkan(
         spdlog::info("GALLERY_PERF event=gallery_dcp_sampling backend={} hue_points={} look_points={}",
             profileTextures && !selected->profileTextureRejected ? "texture" : "buffer",
             hueCount/3u, lookCount/3u);
-    pl_pass_run(selected->gpu, &run);
+    selected->runColorPass(run);
     if (exported && exportNeedsCopy)
         pl_buf_copy(selected->gpu, exported, 0, selected->output, 0, paddedOutput);
     if (output && output->completedThumbnailSourceFrame)
@@ -2463,7 +2503,7 @@ bool colorGalleryRgbVulkan(
                     scheduledThumbnailFrame = output->thumbnailSourceFrame;
                 } else {
                     thumbnail.resize(padded);
-                    pl_pass_run(selected->gpu, &scheduledThumbnailRun);
+                    selected->runColorPass(scheduledThumbnailRun);
                     pl_buf_copy(selected->gpu, slot->download, 0, slot->output, 0, padded);
                     if (pl_buf_read(selected->gpu, slot->download, 0, thumbnail.data(), padded)) {
                         thumbnail.resize(bytes);
@@ -2476,7 +2516,7 @@ bool colorGalleryRgbVulkan(
     }
     auto enqueueThumbnailReadback=[&]{
         if(!scheduledThumbnail)return;
-        pl_pass_run(selected->gpu,&scheduledThumbnailRun);
+        selected->runColorPass(scheduledThumbnailRun);
         pl_buf_copy(selected->gpu,scheduledThumbnail->download,0,
             scheduledThumbnail->output,0,
             (scheduledThumbnailBytes+3u)&~size_t{3});

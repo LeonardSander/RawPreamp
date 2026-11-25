@@ -1,0 +1,125 @@
+--- a/src/include/libplacebo/vulkan.h
++++ b/src/include/libplacebo/vulkan.h
+@@ -24,7 +24,7 @@
+ 
+ PL_API_BEGIN
+ 
+-#define PL_VK_MIN_VERSION VK_API_VERSION_1_2
++#define PL_VK_MIN_VERSION VK_API_VERSION_1_1
+ 
+ // Structure representing a VkInstance. Using this is not required.
+ typedef const struct pl_vk_inst_t {
+--- a/src/vulkan/context.c
++++ b/src/vulkan/context.c
+@@ -91,6 +91,18 @@
+ // functions exported by dependent instance-level extensions
+ static const struct vk_ext vk_device_extensions[] = {
+     {
++        .name = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
++        .funs = (const struct vk_fun[]) {
++            { "vkWaitSemaphoresKHR", offsetof(struct vk_ctx, WaitSemaphores), true },
++            {0}
++        },
++    }, {
++        .name = VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
++        .funs = (const struct vk_fun[]) {
++            { "vkResetQueryPoolEXT", offsetof(struct vk_ctx, ResetQueryPool), true },
++            {0}
++        },
++    }, {
+         .name = VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+         .funs = (const struct vk_fun[]) {
+             PL_VK_DEV_FUN(AcquireNextImageKHR),
+@@ -209,6 +221,8 @@
+ 
+ // Make sure to keep this in sync with the above!
+ const char * const pl_vulkan_recommended_extensions[] = {
++    VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
++    VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
+     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
+@@ -323,6 +337,18 @@
+ 
+ static bool check_required_features(struct vk_ctx *vk)
+ {
++    if (vk->api_ver < VK_API_VERSION_1_2) {
++        const VkPhysicalDeviceTimelineSemaphoreFeatures *timeline =
++            vk_find_struct(&vk->features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
++        const VkPhysicalDeviceHostQueryResetFeatures *queries =
++            vk_find_struct(&vk->features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES);
++        if (!timeline || !timeline->timelineSemaphore || !queries || !queries->hostQueryReset) {
++            PL_ERR(vk, "Vulkan 1.1 requires timeline semaphores and host query reset");
++            return false;
++        }
++        return true;
++    }
++
+     #define CHECK_FEATURE(maj, min, feat) do {                                  \
+         const VkPhysicalDeviceVulkan##maj##min##Features *f;                    \
+         f = vk_find_struct(&vk->features,                                       \
+@@ -427,11 +453,9 @@
+     PL_VK_DEV_FUN(MapMemory),
+     PL_VK_DEV_FUN(QueueSubmit),
+     PL_VK_DEV_FUN(QueueWaitIdle),
+-    PL_VK_DEV_FUN(ResetQueryPool),
+     PL_VK_DEV_FUN(ResetFences),
+     PL_VK_DEV_FUN(SetDebugUtilsObjectNameEXT),
+     PL_VK_DEV_FUN(UpdateDescriptorSets),
+-    PL_VK_DEV_FUN(WaitSemaphores),
+     PL_VK_DEV_FUN(WaitForFences),
+ };
+ 
+@@ -1346,6 +1370,11 @@
+     for (int i = 0; i < ext_funs.num; i++)
+         load_vk_fun(vk, ext_funs.elem[i]);
+ 
++    if (!vk->WaitSemaphores || !vk->ResetQueryPool) {
++        PL_ERR(vk, "Missing timeline semaphore or host query reset entry point");
++        goto error;
++    }
++
+     // Create the command pools for the queues we care about
+     const uint32_t qmax = PL_DEF(params->queue_count, UINT32_MAX);
+     for (int i = 0; i < qfnum; i++) {
+@@ -1687,6 +1716,11 @@
+     vk->GetPhysicalDeviceQueueFamilyProperties(vk->physd, &qfnum, qfs);
+     if (!params->lock_queue)
+         init_queue_locks(vk, qfnum, qfs);
++
++    if (!vk->WaitSemaphores || !vk->ResetQueryPool) {
++        PL_ERR(vk, "Missing imported timeline semaphore or host query reset entry point");
++        goto error;
++    }
+ 
+     // Create the command pools for each unique qf that exists
+     struct {
+--- a/src/vulkan/gpu.c
++++ b/src/vulkan/gpu.c
+@@ -406,7 +406,13 @@
+         }
+     }
+ 
+-    pl_assert(vk->api_ver >= VK_API_VERSION_1_2);
++    if (vk->api_ver < VK_API_VERSION_1_2) {
++        return (struct pl_spirv_version) {
++            .env_version = VK_API_VERSION_1_1,
++            .spv_version = PL_SPV_VERSION(1, 3),
++        };
++    }
++
+     return (struct pl_spirv_version) {
+         .env_version = VK_API_VERSION_1_2,
+         .spv_version = PL_SPV_VERSION(1, 5),
+--- a/src/vulkan/utils_gen.py
++++ b/src/vulkan/utils_gen.py
+@@ -152,6 +152,9 @@
+         core_ver = None
+         if res := re.match(r'VkPhysicalDeviceVulkan(\d)(\d)Features', sname):
+             core_ver = 'VK_API_VERSION_{0}_{1}'.format(res[1], res[2])
++            # The aggregate for Vulkan 1.1 features was introduced in 1.2.
++            if sname == 'VkPhysicalDeviceVulkan11Features':
++                core_ver = 'VK_API_VERSION_1_2'
+ 
+         struct = Obj(name       = sname,
+                      stype      = stype,
