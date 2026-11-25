@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=RawPreamp
-Comment=Mount MotionCam MCRAW files as DNG sequences
+Comment=Raw image workflow utility
 Exec=RawPreamp
 Icon=rawpreamp
 Categories=AudioVideo;Video;
