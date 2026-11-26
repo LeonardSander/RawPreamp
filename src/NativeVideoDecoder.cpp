@@ -25,6 +25,9 @@
 #include <QDebug>
 #include <QJniEnvironment>
 #include "android/MediaCodecImageReader.h"
+#ifdef RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO
+#include <libplacebo/vulkan.h>
+#endif
 extern "C" {
 #include <libavutil/opt.h>
 #include <libavcodec/jni.h>
@@ -45,6 +48,42 @@ extern "C" {
 #endif
 
 namespace {
+
+#if defined(__ANDROID__) && defined(RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO)
+bool hasLegacyAdrenoGpu() {
+    static const bool legacyAdreno = [] {
+        // Query the physical device before applying any logical-device or
+        // interop requirements. MediaCodec can open a surface without them.
+        pl_vk_inst instance = pl_vk_inst_create(nullptr, &pl_vk_inst_default_params);
+        if (!instance) return false;
+
+        pl_vulkan_device_params selection{};
+        selection.instance = instance->instance;
+        selection.get_proc_addr = instance->get_proc_addr;
+        const auto physical = pl_vulkan_choose_device(nullptr, &selection);
+        const auto getProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            instance->get_proc_addr(instance->instance, "vkGetPhysicalDeviceProperties"));
+        VkPhysicalDeviceProperties properties{};
+        if (physical && getProperties)
+            getProperties(physical, &properties);
+        pl_vk_inst_destroy(&instance);
+
+        constexpr uint32_t qualcommVendorId = 0x5143;
+        return properties.vendorID == qualcommVendorId &&
+               properties.apiVersion < VK_API_VERSION_1_2;
+    }();
+    return legacyAdreno;
+}
+
+bool hasUnreliable10BitMediaCodecSurface(const AVCodecParameters& codec) {
+    if (codec.codec_id != AV_CODEC_ID_HEVC && codec.codec_id != AV_CODEC_ID_AV1)
+        return false;
+    const auto* format = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(codec.format));
+    if (!format || !format->nb_components || format->comp[0].depth <= 8)
+        return false;
+    return hasLegacyAdrenoGpu();
+}
+#endif
 
 #if defined(RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO) && defined(VK_KHR_video_decode_h265)
 bool vulkanDecodeRequiresLayeredReferences(const AVVulkanDeviceContext& device,
@@ -381,9 +420,11 @@ void parallelPixelRanges(size_t count, Function&& function) {
 
 namespace rawpreamp {
 
-NativeVideoDecoder::NativeVideoDecoder(const std::string& filePath, bool thumbnailPreview)
+NativeVideoDecoder::NativeVideoDecoder(const std::string& filePath, bool thumbnailPreview,
+                                       bool streamingPreview)
     : mFilePath(filePath),
       mThumbnailPreview(thumbnailPreview),
+      mStreamingPreview(streamingPreview),
       mFormatContext(nullptr),
       mCodecContext(nullptr),
       mCodec(nullptr),
@@ -497,7 +538,15 @@ void NativeVideoDecoder::initDecoder() {
     }
     
     const char* forceSoftwareValue = rawpreamp::debugEnvironment("RAWPREAMP_NATIVE_VIDEO_FORCE_SOFTWARE");
+#if defined(__ANDROID__) && defined(RAWPREAMP_HAS_NATIVE_VIDEO_PLACEBO)
+    const bool unreliableSurface = hasUnreliable10BitMediaCodecSurface(*codecpar);
+#else
+    constexpr bool unreliableSurface = false;
+#endif
+    // Legacy Adreno returns 8-bit HEVC buffers and cannot open this AV1
+    // profile without a surface. Preserve source precision outside previews.
     const bool forceSoftware = mForceSoftwareDecoder ||
+        (unreliableSurface && (!mStreamingPreview || codecpar->codec_id == AV_CODEC_ID_AV1)) ||
         (forceSoftwareValue && forceSoftwareValue[0] != '\0' &&
          std::string(forceSoftwareValue) != "0");
     bool hardwareDecoder = !forceSoftware && initHardwareDecoder();
@@ -553,7 +602,11 @@ void NativeVideoDecoder::initDecoder() {
 #ifdef __ANDROID__
     if (mediaCodecDecoder && !mMediaCodecSurfaceRejected) {
         const char* surface = rawpreamp::debugEnvironment("RAWPREAMP_ANDROID_MEDIACODEC_SURFACE");
-        if (!surface || surface[0] != '0') {
+        // Bypass the corrupt external-image sampling path on legacy Adreno.
+        // MediaCodec can still decode into YUV buffers for Vulkan conversion.
+        if (unreliableSurface)
+            spdlog::info("NativeVideoDecoder: using MediaCodec YUV buffers for 10-bit video on legacy Adreno");
+        if (!unreliableSurface && (!surface || surface[0] != '0')) {
             mCodecContext->hw_device_ctx = MediaCodecImageReader::createDevice(
                 codecpar->width, codecpar->height);
             if (mCodecContext->hw_device_ctx) {

@@ -55,7 +55,8 @@ struct NativeVideoVideoInfo {
 
 class NativeVideoDecoder {
 public:
-    explicit NativeVideoDecoder(const std::string& filePath, bool thumbnailPreview = false);
+    explicit NativeVideoDecoder(const std::string& filePath, bool thumbnailPreview = false,
+                                bool streamingPreview = false);
     ~NativeVideoDecoder();
 
     const NativeVideoVideoInfo& getVideoInfo() const { return mVideoInfo; }
@@ -153,6 +154,7 @@ private:
 private:
     std::string mFilePath;
     const bool mThumbnailPreview;
+    const bool mStreamingPreview;
     NativeVideoVideoInfo mVideoInfo;
     std::vector<NativeVideoFrameInfo> mFrames;
     

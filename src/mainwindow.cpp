@@ -4072,11 +4072,10 @@ void MainWindow::startGalleryRender(rawpreamp::MountId mountId, double startSeco
                     }
                     if(nativeGpuOutput){
                         gpuOutput.gpuBuffer = &preview.galleryDisplayGpu;
-                        // Match the CPU gallery's clockwise 90-degree pixel
-                        // mapping. Rotating this case in the presenter mirrors
-                        // the image horizontally on some Vulkan drivers.
+                        // Produce pixels in display orientation so the native
+                        // presenter fits the texture without rotating its crop.
                         gpuOutput.orientation=isSequence
-                            ?(thumbnailOrientation==90?90:0)
+                            ?std::max(0,thumbnailOrientation)
                             :(rawOrientation<0?0:rawOrientation);
                         gpuOutput.rgb10a2=true;
                     }
@@ -4190,8 +4189,7 @@ void MainWindow::startGalleryRender(rawpreamp::MountId mountId, double startSeco
                     auto gpuBuffer = std::move(preview.galleryDisplayGpu);
                     if (gpuBuffer){
                         gpuBuffer->sourceFrameIndex=static_cast<int>(preview.sourceFrameIndex);
-                        gpuBuffer->orientation=isSequence
-                            ?(thumbnailOrientation==90?0:thumbnailOrientation):0;
+                        gpuBuffer->orientation=0;
                         gpuBuffer->staticFrame=!isSequence;
                         if (gpuBuffer->rejectSharedImage) {
                             auto reject = std::move(gpuBuffer->rejectSharedImage);

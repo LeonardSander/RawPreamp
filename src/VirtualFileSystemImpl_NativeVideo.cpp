@@ -167,7 +167,8 @@ VirtualFileSystemImpl_NativeVideo::VirtualFileSystemImpl_NativeVideo(
 
     // Initialize NativeVideoDecoder
     try {
-        mDecoder = std::make_unique<NativeVideoDecoder>(mSrcPath, mConfig.thumbnailPreview);
+        mDecoder = std::make_unique<NativeVideoDecoder>(
+            mSrcPath, mConfig.thumbnailPreview, mConfig.streamingPreview);
         mDecoder->overrideTimestamps(vfs::sidecarTimestamps(
             mSidecarMetadata, mDecoder->getFrames().size()));
         if (mCalibration && mCalibration->hasDataLevels) {

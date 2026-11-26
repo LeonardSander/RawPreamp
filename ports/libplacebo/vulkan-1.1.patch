@@ -123,3 +123,56 @@
  
          struct = Obj(name       = sname,
                       stype      = stype,
+--- a/src/vulkan/command.c
++++ b/src/vulkan/command.c
+@@ -176,7 +176,8 @@
+     return flags;
+ }
+
+-static VkPipelineStageFlags lower_stage2(VkPipelineStageFlags2 flags2)
++static VkPipelineStageFlags lower_stage2(VkPipelineStageFlags2 flags2,
++                                        VkPipelineStageFlags fallback)
+ {
+     VkPipelineStageFlags flags = flags2 & VK_PIPELINE_STAGE_FLAG_BITS_MAX_ENUM;
+     SET(VK_PIPELINE_STAGE_TRANSFER_BIT,     VK_PIPELINE_STAGE_2_COPY_BIT |
+@@ -185,7 +186,7 @@
+                                             VK_PIPELINE_STAGE_2_CLEAR_BIT);
+     SET(VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+                                             VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT);
+-    return flags;
++    return flags ? flags : fallback;
+ }
+
+ #undef SET
+@@ -217,8 +218,8 @@
+             .size                = barr2->size,
+         };
+
+-        vk->CmdPipelineBarrier(cmd->buf, lower_stage2(barr2->srcStageMask),
+-                               lower_stage2(barr2->dstStageMask),
++        vk->CmdPipelineBarrier(cmd->buf, lower_stage2(barr2->srcStageMask, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
++                               lower_stage2(barr2->dstStageMask, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT),
+                                info->dependencyFlags,
+                                0, NULL, 1, &barr, 0, NULL);
+
+@@ -238,8 +239,8 @@
+             .subresourceRange    = barr2->subresourceRange,
+         };
+
+-        vk->CmdPipelineBarrier(cmd->buf, lower_stage2(barr2->srcStageMask),
+-                               lower_stage2(barr2->dstStageMask),
++        vk->CmdPipelineBarrier(cmd->buf, lower_stage2(barr2->srcStageMask, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
++                               lower_stage2(barr2->dstStageMask, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT),
+                                info->dependencyFlags,
+                                0, NULL, 0, NULL, 1, &barr);
+     }
+@@ -450,7 +451,8 @@
+
+     for (int i = 0; i < num_deps; i++) {
+         deps[i] = info2->pWaitSemaphoreInfos[i].semaphore;
+-        masks[i] = info2->pWaitSemaphoreInfos[i].stageMask;
++        masks[i] = lower_stage2(info2->pWaitSemaphoreInfos[i].stageMask,
++                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+         depvals[i] = info2->pWaitSemaphoreInfos[i].value;
+     }
+     for (int i = 0; i < num_sigs; i++) {

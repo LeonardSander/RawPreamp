@@ -4072,15 +4072,19 @@ QImage ClipPlayerDialog::rgb48Image(const QByteArray& frame,int width,int height
     const qint64 pixels=qint64(width)*height;
     const int stride=frame.size()==pixels*3?3:frame.size()>=pixels*6?6:0;
     if(!stride)return {};
-    const int orientation=mIndex>=0?mClips[mIndex].orientation:-1;
+    // Callers pass the source dimensions even when the GPU already rotated
+    // the rows. Use the resulting stride for both views and copied images.
+    int orientation=mIndex>=0?mClips[mIndex].orientation:-1;
+    if(preOriented){
+        if(orientation==90||orientation==270)std::swap(width,height);
+        orientation=0;
+    }
     const bool swap=orientation==90||orientation==270;
-    if(pixelsOwner && stride==3 &&
-       (preOriented || (orientation!=90&&orientation!=180&&orientation!=270))){
+    const bool rotate=swap||orientation==180;
+    if(pixelsOwner&&stride==3&&!rotate){
         auto* owner=new std::shared_ptr<const uint8_t>(std::move(pixelsOwner));
-        const int imageWidth=preOriented&&swap?height:width;
-        const int imageHeight=preOriented&&swap?width:height;
         QImage view(reinterpret_cast<const uchar*>((*owner).get()),
-            imageWidth,imageHeight,imageWidth*3,QImage::Format_RGB888,
+            width,height,width*3,QImage::Format_RGB888,
             [](void* context){delete static_cast<std::shared_ptr<const uint8_t>*>(context);},
             owner);
         if(!view.isNull()){
@@ -4094,13 +4098,10 @@ QImage ClipPlayerDialog::rgb48Image(const QByteArray& frame,int width,int height
         }
         delete owner;
     }
-    if(backing && stride==3 && backing->size()==size_t(pixels*3) &&
-       (preOriented || (orientation!=90&&orientation!=180&&orientation!=270))){
+    if(backing&&stride==3&&!rotate&&backing->size()==size_t(pixels*3)){
         auto* owner=new std::shared_ptr<const std::vector<uint8_t>>(std::move(backing));
-        const int imageWidth=preOriented&&swap?height:width;
-        const int imageHeight=preOriented&&swap?width:height;
         QImage view(reinterpret_cast<const uchar*>((*owner)->data()),
-            imageWidth,imageHeight,imageWidth*3,QImage::Format_RGB888,
+            width,height,width*3,QImage::Format_RGB888,
             [](void* context){delete static_cast<std::shared_ptr<const std::vector<uint8_t>>*>(context);},
             owner);
         if(!view.isNull()){
@@ -4115,7 +4116,7 @@ QImage ClipPlayerDialog::rgb48Image(const QByteArray& frame,int width,int height
     QImage image(swap?height:width,swap?width:height,QImage::Format_RGB888);
     if(image.isNull())return {};
     const auto* source=reinterpret_cast<const uchar*>(frame.constData());
-    if(orientation!=90&&orientation!=180&&orientation!=270){
+    if(!rotate){
         for(int y=0;y<height;++y){
             auto* destination=image.scanLine(y);
             const auto* row=source+qsizetype(y)*width*stride;
